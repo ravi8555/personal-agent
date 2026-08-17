@@ -2,6 +2,7 @@ import { log } from "node:console"
 import { HARNESS_PROMPTS } from "./config.js"
 import { Memory } from "./memory.js"
 import { MemoryProcessor } from "./memoryProcessor.js"
+import { MemoryScheduler } from "./memoryScheduler.js"
 import type { IMessage, IMemory, MessageListener } from "./memory.js"
 import Openai from 'openai'
 import "dotenv/config"
@@ -52,6 +53,7 @@ export class Agent {
     private readonly instructions: string
     private readonly memory: IMemory
     private readonly memoryProcessor: MemoryProcessor
+    private memoryScheduler: MemoryScheduler | undefined
     private readonly openai: Openai
     public readonly toolMap: Map<string, ITool>
 
@@ -91,6 +93,15 @@ export class Agent {
     /** A processor for reading / analysing the agent's conversation history. */
     public getMemoryProcessor(): MemoryProcessor {
         return this.memoryProcessor
+    }
+
+    /**
+     * The agent's background scheduler (created lazily). Call .start() with a
+     * task to run memory processing periodically (default every 3 minutes).
+     */
+    public getMemoryScheduler(): MemoryScheduler {
+        this.memoryScheduler ??= new MemoryScheduler({ memory: this.memory })
+        return this.memoryScheduler
     }
 
     /** Observe every new message appended to the conversation memory. */
