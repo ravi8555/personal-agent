@@ -31,8 +31,9 @@ Common properties: `extractedAt` (ISO), `extractionId` (provenance back to the
 (:Feedback)-[:ABOUT {extractedAt, extractionId}]->(:Entity)
 ```
 
-- `RELATES_TO` carries the (Step-6 normalized) predicate between two entities,
-  e.g. `(User)-[:RELATES_TO {predicate:"prefers"}]->(coffee)`.
+- `RELATES_TO` carries the (Step-6 normalized) canonical predicate between two
+  entities, e.g. `(User)-[:RELATES_TO {predicate:"PREFERS"}]->(coffee)`. Raw
+  predicates that match no normalization rule keep their cleaned form.
 - `ABOUT` connects every memory item to the entities it mentions, enabling
   entity-centric retrieval (context watcher, Steps 9–10).
 
