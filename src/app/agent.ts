@@ -3,11 +3,15 @@ import { HARNESS_PROMPTS } from "./config.js"
 import { Memory } from "./memory.js"
 import { MemoryProcessor } from "./memoryProcessor.js"
 import { MemoryScheduler } from "./memoryScheduler.js"
+import type { IMemorySchedulerOptions } from "./memoryScheduler.js"
+import { MemoryExtractor } from "./memoryExtraction.js"
 import type { IMessage, IMemory, MessageListener } from "./memory.js"
+import type { IMemoryExtraction, IMemoryExtractor } from "./memoryExtraction.js"
 import Openai from 'openai'
 import "dotenv/config"
 
 export type { IMessage, IMemory, MessageListener } from './memory.js'
+export type { IMemoryExtraction, IMemoryExtractor, IExtractedRelation, IExtractedFeedback, ExtractionFeedbackType } from './memoryExtraction.js'
 
 export interface ITool {
     name: string
@@ -23,6 +27,7 @@ export class AgentBuilder {
     public instructions: string | undefined
     public toolList: ITool[]
     public memory: IMemory | undefined
+    public memoryExtractor: IMemoryExtractor | undefined
 
     constructor() {
         this.toolList = []
@@ -44,6 +49,16 @@ export class AgentBuilder {
         return this
     }
 
+    /**
+     * Inject a custom memory extractor (Step 4: summary / facts / relations /
+     * feedback). If omitted, a default OpenAI-backed extractor is created when
+     * OPENAI_API_KEY is present.
+     */
+    public withMemoryExtractor(extractor: IMemoryExtractor) {
+        this.memoryExtractor = extractor
+        return this
+    }
+
     public build() {
         return new Agent(this)
     }
@@ -54,6 +69,8 @@ export class Agent {
     private readonly memory: IMemory
     private readonly memoryProcessor: MemoryProcessor
     private memoryScheduler: MemoryScheduler | undefined
+    private readonly memoryExtractor: IMemoryExtractor | undefined
+    private readonly memoryExtractions: IMemoryExtraction[] = []
     private readonly openai: Openai
     public readonly toolMap: Map<string, ITool>
 
@@ -83,6 +100,11 @@ export class Agent {
 
         // A processor that reads / analyses the agent's conversation history.
         this.memoryProcessor = new MemoryProcessor(this.memory)
+
+        // A memory extractor (Step 4). Defaults to an OpenAI-backed extractor
+        // when an API key is configured, so the 3-minute scheduler can run
+        // extraction automatically; otherwise extraction is skipped.
+        this.memoryExtractor = builder.memoryExtractor ?? this.createDefaultExtractor()
     }
 
     /** The memory / conversation-history backing this agent. */
@@ -96,12 +118,50 @@ export class Agent {
     }
 
     /**
-     * The agent's background scheduler (created lazily). Call .start() with a
-     * task to run memory processing periodically (default every 3 minutes).
+     * The agent's background scheduler (created lazily). Every 3 minutes it
+     * runs the memory extractor over newly accumulated messages and records
+     * the resulting extraction records (Step 4). If no extractor is available,
+     * no processing occurs.
      */
     public getMemoryScheduler(): MemoryScheduler {
-        this.memoryScheduler ??= new MemoryScheduler({ memory: this.memory })
+        if (!this.memoryScheduler) {
+            const extractor = this.memoryExtractor
+            const options: IMemorySchedulerOptions = extractor
+                ? { memory: this.memory, task: (batch) => this.runExtraction(batch, extractor) }
+                : { memory: this.memory }
+            this.memoryScheduler = new MemoryScheduler(options)
+        }
         return this.memoryScheduler
+    }
+
+    /**
+     * The structured extraction records produced so far by the background
+     * scheduler (summary / facts / relations / feedback). Empty until the
+     * scheduler runs.
+     */
+    public getMemoryExtractions(): readonly IMemoryExtraction[] {
+        return this.memoryExtractions
+    }
+
+    private async runExtraction(batch: readonly IMessage[], extractor: IMemoryExtractor): Promise<void> {
+        const extraction = await extractor.extract(batch)
+        this.memoryExtractions.push(extraction)
+    }
+
+    /**
+     * A default extractor backed by the agent's OpenAI client. Returns
+     * undefined when no API key is configured so the scheduler stays a no-op.
+     */
+    private createDefaultExtractor(): IMemoryExtractor | undefined {
+        if (!process.env.OPENAI_API_KEY) return undefined
+        return new MemoryExtractor(async (prompt) => {
+            const response = await this.openai.chat.completions.create({
+                model: 'gpt-4o',
+                messages: [{ role: 'user', content: prompt }],
+                response_format: { type: 'json_object' },
+            })
+            return response.choices[0]?.message.content ?? null
+        })
     }
 
     /** Observe every new message appended to the conversation memory. */
@@ -120,6 +180,8 @@ export class Agent {
     public async run(query: string): Promise<readonly IMessage[] | undefined> {
         // Record the user query in the conversation memory.
         this.memory.addUser(query)
+
+        
 
         for (let i = 0; i < this.MAX_LOOP; i++) {
             // Call LLM with the system prompt + full conversation history.

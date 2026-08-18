@@ -38,7 +38,20 @@ async function init() {
 
         agent.attachInterceptor(message => console.log(`Message : ${message.role } ${message.content}`))
 
-        const result = await agent.run('Can you build a simple Hello world programme in c++ on my current project as hello.cpp')
+        const result = await agent.run('My name is Ravi.I live in Akola.I prefer React over Angular.I dont like coffee.')
+            
+        // // check memory
+        //     console.log("\n===== MEMORY =====");
+        //     console.log(
+        //         agent.getMemoryProcessor().readHistory()
+        //     );
+
+        // check actual extraction
+//         const scheduler = agent.getMemoryScheduler();
+//         await scheduler.tick();
+//            console.log(
+//     agent.getMemoryExtractions()
+// );
 
         console.log(result![result?.length! -1]);
         
