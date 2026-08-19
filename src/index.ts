@@ -4,6 +4,9 @@ import axios from 'axios'
 
 import { exec } from 'child_process';
 
+import { normalizePredicate, normalizeRelation, normalizeRelations } from './app/graphNormalization.js';
+import { entityKey } from './app/graphSchema.js';
+
 const weatherTool :ITool = {
     name : 'fetchWeatherInfo',
     description : 'fetch weather real time data by city name',
@@ -38,7 +41,10 @@ async function init() {
 
         agent.attachInterceptor(message => console.log(`Message : ${message.role } ${message.content}`))
 
-        const result = await agent.run('My name is Ravi.I live in Akola.I prefer React over Angular.I dont like coffee.')
+        const result = 
+        // await agent.run('My name is Ravi.I live in Akola.I prefer React over Angular.I dont like coffee.')
+
+        await agent.run("I prefer tea over coffee.");
             
         // // check memory
         //     console.log("\n===== MEMORY =====");
@@ -52,6 +58,73 @@ async function init() {
 //            console.log(
 //     agent.getMemoryExtractions()
 // );
+
+/* check graphnormalization and graphschema */
+
+// console.log(normalizePredicate('likes'));
+// console.log(normalizePredicate('enjoys'));
+// console.log(normalizePredicate('does not like'));
+// console.log(normalizePredicate('lives in'));
+// console.log(normalizePredicate('LIVES_IN'));
+// console.log(normalizePredicate('some random relation'));
+
+// console.log(entityKey(' Ravi '));
+// console.log(entityKey('RAVI'));
+// console.log(entityKey('  Ravi   Kumar  '));
+
+
+// const relation = normalizeRelation({
+//     subject: ' Ravi ',
+//     predicate: 'enjoys',
+//     object: ' Coffee ',
+//     confidence: 0.95,
+// });
+
+// console.log(relation);
+
+
+// const relations = normalizeRelations([
+//     {
+//         subject: 'Ravi',
+//         predicate: 'likes',
+//         object: 'Coffee',
+//     },
+//     {
+//         subject: 'Ravi',
+//         predicate: 'enjoys',
+//         object: 'Coffee',
+//     },
+//     {
+//         subject: 'Ravi',
+//         predicate: 'does not like',
+//         object: 'Tea',
+//     },
+//     {
+//         subject: 'Ravi',
+//         predicate: 'lives in',
+//         object: 'Akola',
+//     },
+// ]);
+
+// console.dir(relations, { depth: null });
+
+
+/* test complete memory pipeline*/
+const scheduler = agent.getMemoryScheduler();
+
+// await scheduler.tick();
+
+// console.dir(
+//     agent.getMemoryExtractions(),
+//     { depth: null }
+// );
+
+/* test Verify the scheduler processes only new history*/
+// console.log(agent.getMemoryExtractions().length);
+
+await scheduler.tick();
+
+console.log(agent.getMemoryExtractions().length);
 
         console.log(result![result?.length! -1]);
         

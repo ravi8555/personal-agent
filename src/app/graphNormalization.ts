@@ -178,3 +178,22 @@ export function normalizeRelations(
         .map(normalizeRelation)
         .filter((relation): relation is INormalizedRelation => relation !== null)
 }
+
+/**
+ * Remove exact duplicates (same subject, predicate and object) so a single
+ * extraction never writes the same relation twice. Graph-level dedup is still
+ * enforced by MERGE on (subject, predicate, object) in Step 7/8.
+ */
+export function deduplicateRelations(
+    relations: readonly INormalizedRelation[],
+): INormalizedRelation[] {
+    const seen = new Set<string>()
+    const result: INormalizedRelation[] = []
+    for (const relation of relations) {
+        const key = `${relation.subject}\u0000${relation.predicate}\u0000${relation.object}`
+        if (seen.has(key)) continue
+        seen.add(key)
+        result.push(relation)
+    }
+    return result
+}

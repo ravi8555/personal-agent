@@ -4,6 +4,9 @@ import { Memory } from "./memory.js"
 import { MemoryProcessor } from "./memoryProcessor.js"
 import { MemoryScheduler } from "./memoryScheduler.js"
 import type { IMemorySchedulerOptions } from "./memoryScheduler.js"
+import { ContextWatcher, defaultTopicAnalyzer } from "./contextWatcher.js"
+import type { TopicAnalyzer } from "./contextWatcher.js"
+import { Neo4jMemoryStore } from "./graphStore.js"
 import { MemoryExtractor } from "./memoryExtraction.js"
 import type { IMessage, IMemory, MessageListener } from "./memory.js"
 import type { IMemoryExtraction, IMemoryExtractor } from "./memoryExtraction.js"
@@ -28,6 +31,8 @@ export class AgentBuilder {
     public toolList: ITool[]
     public memory: IMemory | undefined
     public memoryExtractor: IMemoryExtractor | undefined
+    public memoryStore: Neo4jMemoryStore | undefined
+    public topicAnalyzer: TopicAnalyzer | undefined
 
     constructor() {
         this.toolList = []
@@ -59,6 +64,24 @@ export class AgentBuilder {
         return this
     }
 
+    /**
+     * Inject the Neo4j graph store (Steps 7-8). When set, every extraction
+     * produced by the background scheduler is also written to the graph.
+     */
+    public withMemoryStore(store: Neo4jMemoryStore) {
+        this.memoryStore = store
+        return this
+    }
+
+    /**
+     * Inject a custom topic detector for the context watcher (Step 9).
+     * Defaults to the rule-based defaultTopicAnalyzer.
+     */
+    public withTopicAnalyzer(analyzer: TopicAnalyzer) {
+        this.topicAnalyzer = analyzer
+        return this
+    }
+
     public build() {
         return new Agent(this)
     }
@@ -69,7 +92,10 @@ export class Agent {
     private readonly memory: IMemory
     private readonly memoryProcessor: MemoryProcessor
     private memoryScheduler: MemoryScheduler | undefined
+    private contextWatcher: ContextWatcher | undefined
     private readonly memoryExtractor: IMemoryExtractor | undefined
+    private readonly memoryStore: Neo4jMemoryStore | undefined
+    private readonly topicAnalyzer: TopicAnalyzer | undefined
     private readonly memoryExtractions: IMemoryExtraction[] = []
     private readonly openai: Openai
     public readonly toolMap: Map<string, ITool>
@@ -105,6 +131,13 @@ export class Agent {
         // when an API key is configured, so the 3-minute scheduler can run
         // extraction automatically; otherwise extraction is skipped.
         this.memoryExtractor = builder.memoryExtractor ?? this.createDefaultExtractor()
+
+        // Optional Neo4j graph store (Steps 7-8). When set, extractions are
+        // also written into the graph.
+        this.memoryStore = builder.memoryStore
+
+        // Optional custom topic detector for the context watcher (Step 9).
+        this.topicAnalyzer = builder.topicAnalyzer
     }
 
     /** The memory / conversation-history backing this agent. */
@@ -143,9 +176,28 @@ export class Agent {
         return this.memoryExtractions
     }
 
+    /**
+     * The agent's context watcher (Step 9, created lazily). A second background
+     * process that keeps a live view of the current conversation topic. Call
+     * .start() to begin polling; topic changes notify subscribers and (when a
+     * retriever is attached, Step 10) refresh relevant knowledge.
+     */
+    public getContextWatcher(): ContextWatcher {
+        if (!this.contextWatcher) {
+            this.contextWatcher = new ContextWatcher({
+                memory: this.memory,
+                analyzer: this.topicAnalyzer ?? defaultTopicAnalyzer,
+            })
+        }
+        return this.contextWatcher
+    }
+
     private async runExtraction(batch: readonly IMessage[], extractor: IMemoryExtractor): Promise<void> {
         const extraction = await extractor.extract(batch)
         this.memoryExtractions.push(extraction)
+        if (this.memoryStore) {
+            await this.memoryStore.saveExtraction(extraction)
+        }
     }
 
     /**
