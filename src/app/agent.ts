@@ -5,8 +5,19 @@ import { MemoryProcessor } from "./memoryProcessor.js"
 import { MemoryScheduler } from "./memoryScheduler.js"
 import type { IMemorySchedulerOptions } from "./memoryScheduler.js"
 import { ContextWatcher, defaultTopicAnalyzer } from "./contextWatcher.js"
-import type { TopicAnalyzer } from "./contextWatcher.js"
+import type { ICurrentTopic, TopicAnalyzer, KnowledgeRetriever } from "./contextWatcher.js"
+import { buildRunningContext } from "./runningContext.js"
+import type { IRunningContext } from "./runningContext.js"
+import type { IRelevantKnowledge } from "./graphRetrieval.js"
+import { createGraphKnowledgeRetriever } from "./graphRetrieval.js"
+import { normalizeRelations } from "./graphNormalization.js"
+import type { INormalizedRelation } from "./graphNormalization.js"
+import type { IRetrievedRelation } from "./graphRetrieval.js"
 import { Neo4jMemoryStore } from "./graphStore.js"
+import { detectConflicts } from "./conflictDetector.js"
+import { decideFeedback } from "./feedbackEngine.js"
+import type { IConflictAnalysis, IConflictFinding } from "./conflictDetector.js"
+import type { IFeedback } from "./feedbackEngine.js"
 import { MemoryExtractor } from "./memoryExtraction.js"
 import type { IMessage, IMemory, MessageListener } from "./memory.js"
 import type { IMemoryExtraction, IMemoryExtractor } from "./memoryExtraction.js"
@@ -33,6 +44,7 @@ export class AgentBuilder {
     public memoryExtractor: IMemoryExtractor | undefined
     public memoryStore: Neo4jMemoryStore | undefined
     public topicAnalyzer: TopicAnalyzer | undefined
+    public knowledgeRetriever: KnowledgeRetriever | undefined
 
     constructor() {
         this.toolList = []
@@ -82,6 +94,16 @@ export class AgentBuilder {
         return this
     }
 
+    /**
+     * Inject a custom knowledge retriever for the context watcher (Step 10).
+     * When not set, a Neo4j-backed retriever is created automatically if a
+     * memory store is configured.
+     */
+    public withKnowledgeRetriever(retriever: KnowledgeRetriever) {
+        this.knowledgeRetriever = retriever
+        return this
+    }
+
     public build() {
         return new Agent(this)
     }
@@ -96,6 +118,7 @@ export class Agent {
     private readonly memoryExtractor: IMemoryExtractor | undefined
     private readonly memoryStore: Neo4jMemoryStore | undefined
     private readonly topicAnalyzer: TopicAnalyzer | undefined
+    private readonly knowledgeRetriever: KnowledgeRetriever | undefined
     private readonly memoryExtractions: IMemoryExtraction[] = []
     private readonly openai: Openai
     public readonly toolMap: Map<string, ITool>
@@ -138,6 +161,10 @@ export class Agent {
 
         // Optional custom topic detector for the context watcher (Step 9).
         this.topicAnalyzer = builder.topicAnalyzer
+
+        // Optional custom graph retriever (Step 10); falls back to a
+        // store-backed retriever when no custom one is provided.
+        this.knowledgeRetriever = builder.knowledgeRetriever
     }
 
     /** The memory / conversation-history backing this agent. */
@@ -176,6 +203,11 @@ export class Agent {
         return this.memoryExtractions
     }
 
+    /** The most recent extraction record, or undefined until the scheduler runs. */
+    public get lastExtraction(): IMemoryExtraction | undefined {
+        return this.memoryExtractions[this.memoryExtractions.length - 1]
+    }
+
     /**
      * The agent's context watcher (Step 9, created lazily). A second background
      * process that keeps a live view of the current conversation topic. Call
@@ -184,12 +216,130 @@ export class Agent {
      */
     public getContextWatcher(): ContextWatcher {
         if (!this.contextWatcher) {
-            this.contextWatcher = new ContextWatcher({
-                memory: this.memory,
-                analyzer: this.topicAnalyzer ?? defaultTopicAnalyzer,
-            })
+            const store = this.memoryStore
+            const retriever = this.knowledgeRetriever
+                ?? (store ? createGraphKnowledgeRetriever(store) : undefined)
+
+            const options = retriever
+                ? {
+                    memory: this.memory,
+                    analyzer: this.topicAnalyzer ?? defaultTopicAnalyzer,
+                    retriever,
+                }
+                : {
+                    memory: this.memory,
+                    analyzer: this.topicAnalyzer ?? defaultTopicAnalyzer,
+                }
+            this.contextWatcher = new ContextWatcher(options)
         }
         return this.contextWatcher
+    }
+
+    /**
+     * Step 11: resolve the retriever used for the running context. Prefers an
+     * injected custom retriever, then the Neo4j-backed one when a store exists.
+     */
+    private resolveKnowledgeRetriever(): KnowledgeRetriever | undefined {
+        if (this.knowledgeRetriever) return this.knowledgeRetriever
+        return this.memoryStore ? createGraphKnowledgeRetriever(this.memoryStore) : undefined
+    }
+
+    /** Detect the current conversation topic from recent user messages. */
+    private detectCurrentTopic(): ICurrentTopic {
+        const userMessages = this.memory.getMessages()
+            .filter(message => message.role === 'user')
+            .slice(-3)
+        const analyzer = this.topicAnalyzer ?? defaultTopicAnalyzer
+        const recent = userMessages.length > 0 ? userMessages : this.memory.getMessages()
+        return analyzer(recent)
+    }
+
+    /**
+     * Step 11: assemble the running context — relevant graph knowledge for the
+     * current topic, formatted for injection into the next LLM call. Returns
+     * null when no retriever is configured, so this is safe to call with no
+     * graph store wired up.
+     */
+    public async buildRunningContext(): Promise<IRunningContext | null> {
+        const retriever = this.resolveKnowledgeRetriever()
+        if (!retriever) return null
+
+        const topic = this.detectCurrentTopic()
+        if (!topic.key) return null
+
+        const knowledge = (await retriever(topic, this.memoryProcessor)) as IRelevantKnowledge | null
+        const running = buildRunningContext(topic, knowledge)
+        if (!running) return null
+
+        // Step 12: append any conflict-feedback decisions about the latest
+        // extraction to the running context block so the next LLM call can
+        // respond appropriately.
+        const latestExtraction = this.lastExtraction
+        if (latestExtraction) {
+            const feedback = await this.analyzeConversationFeedback(latestExtraction)
+            if (feedback && feedback.length > 0) {
+                const sections = feedback.map(fb => `- ${fb.context} (reason: ${fb.reason})`)
+                running.text += `\n\n[Conflict feedback]\n${sections.join('\n')}`
+            }
+        }
+
+        return running
+    }
+
+    /**
+     * Step 12 — feedback detection against the graph.
+     *
+     * Runs the ConflictDetector on the given extraction's normalized relations
+     * vs the relations currently in the graph (retrieved for the same subject),
+     * then runs the FeedbackEngine on each conflict so the running context can
+     * tell the LLM how to act. No graph mutation happens here.
+     *
+     * @returns the feedback decisions, or null when no graph store/retriever is
+     * configured — so this is optional and safe to call with no Neo4j.
+     */
+    public async analyzeConversationFeedback(
+        extraction: IMemoryExtraction,
+    ): Promise<readonly IFeedback[] | null> {
+        const retriever = this.resolveKnowledgeRetriever()
+        if (!retriever) return null
+
+        const relations = normalizeRelations(extraction.relations)
+        if (relations.length === 0) return []
+
+        const analysis = await this.detectConflictsAgainstGraph(relations, extraction)
+        if (!analysis || !analysis.conflict) return []
+
+        return analysis.findings.map(f => decideFeedback(f))
+    }
+
+    /** Step 12: build the conflict model for the given relations against the graph. */
+    private async detectConflictsAgainstGraph(
+        current: readonly INormalizedRelation[],
+        extraction: IMemoryExtraction,
+    ): Promise<IConflictAnalysis | null> {
+        const retriever = this.resolveKnowledgeRetriever()
+        if (!retriever) return null
+
+        // Gather the graph relations for every subject involved in the current
+        // extraction (so we compare like-for-like).
+        const historicalById: Record<string, IRetrievedRelation[]> = {}
+        for (const rel of current) {
+            const topic: ICurrentTopic = {
+                key: rel.subject,
+                topic: rel.subject,
+                evidence: [],
+                observedAt: new Date().toISOString(),
+            }
+            const knowledge = (await retriever(topic, this.memoryProcessor)) as IRelevantKnowledge | null
+            if (knowledge) {
+                historicalById[rel.subject] = (historicalById[rel.subject] ?? []).concat(knowledge.relations)
+            }
+        }
+
+        const historical = Object.values(historicalById).flat()
+        const evidence = [...extraction.facts, ...extraction.summary]
+
+        return detectConflicts({ current, historical, evidence })
     }
 
     private async runExtraction(batch: readonly IMessage[], extractor: IMemoryExtractor): Promise<void> {
@@ -233,16 +383,37 @@ export class Agent {
         // Record the user query in the conversation memory.
         this.memory.addUser(query)
 
+        // Step 11: pull relevant graph knowledge for the current topic and make
+        // it part of the "running context" of the next LLM call. Guarded so a
+        // graph store outage never breaks the conversation.
+        let runningContext: string | null = null
+        try {
+            const context = await this.buildRunningContext()
+            runningContext = context ? context.text : null
+        } catch {
+            runningContext = null
+        }
+
         
 
         for (let i = 0; i < this.MAX_LOOP; i++) {
-            // Call LLM with the system prompt + full conversation history.
+            const messages: Array<{ role: 'system' | 'user' | 'assistant' | 'developer'; content: string }> = [
+                { role: 'system', content: this.instructions },
+            ]
+
+            // Relevant graph knowledge (Step 11) only when something was retrieved.
+            if (runningContext) {
+                messages.push({ role: 'developer', content: runningContext })
+            }
+
+            // Full short-term message history.
+            messages.push(
+                ...this.memory.getMessages().map(e => ({ role: e.role, content: e.content })),
+            )
+
             const llmResponse = await this.openai.chat.completions.create({
                 model: 'gpt-4o',
-                messages: [
-                    { role: 'system', content: this.instructions },
-                    ...this.memory.getMessages().map(e => ({ role: e.role, content: e.content }))
-                ]
+                messages,
             })
 
             const rawLLMResponse: string | null = llmResponse.choices[0]?.message.content ?? null

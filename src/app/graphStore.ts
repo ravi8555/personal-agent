@@ -21,6 +21,7 @@ import type { IMemoryExtraction } from './memoryExtraction.js'
 import { SCHEMA_DDL } from './graphSchema.js'
 import { normalizeRelations } from './graphNormalization.js'
 import { buildWriteQueries, type IGraphWriteQuery } from './graphCypher.js'
+import type { IGraphQueryResult } from './graphRetrieval.js'
 import neo4j from 'neo4j-driver'
 
 export interface IGraphTransaction {
@@ -102,11 +103,11 @@ export class Neo4jMemoryStore {
         }
     }
 
-    /** Run an arbitrary (parameterized) read/write query. Used by later steps. */
-    public async runQuery(query: string, params?: Record<string, unknown>): Promise<unknown> {
+    /** Run an arbitrary (parameterized) read/write query. Used for retrieval. */
+    public async runQuery(query: string, params?: Record<string, unknown>): Promise<IGraphQueryResult> {
         const session = this.makeSession()
         try {
-            return await session.run(query, params)
+            return (await session.run(query, params)) as IGraphQueryResult
         } finally {
             await session.close()
         }

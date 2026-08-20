@@ -112,6 +112,8 @@ export function entityKey(name: string): string {
  * One-time schema DDL: unique constraints + indexes, applied to Neo4j with a
  * Cypher session (executed in Step 8 / migrations). Safe to run repeatedly.
  */
+export const FULLTEXT_FACT_INDEX = 'fact_text_ft'
+
 export const SCHEMA_DDL: readonly string[] = [
     // Entity names are unique graph keys.
     `CREATE CONSTRAINT entity_name_unique IF NOT EXISTS FOR (e:${GRAPH_NODE_LABELS.Entity}) REQUIRE e.name IS UNIQUE`,
@@ -122,7 +124,7 @@ export const SCHEMA_DDL: readonly string[] = [
     `CREATE INDEX fact_extracted_at_idx IF NOT EXISTS FOR (f:${GRAPH_NODE_LABELS.Fact}) ON (f.extractedAt)`,
     `CREATE INDEX summary_extracted_at_idx IF NOT EXISTS FOR (s:${GRAPH_NODE_LABELS.Summary}) ON (s.extractedAt)`,
     // Keyword search over fact text (used by the context watcher, Step 9/10).
-    `CREATE FULLTEXT INDEX fact_text_ft IF NOT EXISTS FOR (f:${GRAPH_NODE_LABELS.Fact}) ON EACH [f.text]`,
+    `CREATE FULLTEXT INDEX ${FULLTEXT_FACT_INDEX} IF NOT EXISTS FOR (f:${GRAPH_NODE_LABELS.Fact}) ON EACH [f.text]`,
     // Predicate lookups on relation edges.
     `CREATE INDEX relates_predicate_idx IF NOT EXISTS FOR ()-[r:${GRAPH_RELATIONSHIPS.RelatesTo}]-() ON (r.predicate)`,
 ]
