@@ -11,9 +11,23 @@
 export interface IMessage {
     role: 'user' | 'assistant' | 'developer'
     content: string
+    /**
+     * Stable message id, assigned by IMemory implementations when a message is
+     * added. The background pipeline (BackgroundMemoryProcessor) uses these ids
+     * to track its watermark ({@link IMemoryProcessingState.lastProcessedMessageId})
+     * so it only ever processes NEW history.
+     */
+    id?: string
 }
 
 export type MessageListener = (message: IMessage) => void
+
+/** Monotonic source of stable message ids (message-1, message-2, ...). */
+let nextMessageId = 0
+export function makeMessageId(): string {
+    nextMessageId += 1
+    return `message-${nextMessageId}`
+}
 
 export interface IMemory {
     /** Immutable snapshot of every message recorded so far. */
@@ -39,7 +53,9 @@ export class Memory implements IMemory {
     private readonly listeners: MessageListener[] = []
 
     constructor(initialMessages: readonly IMessage[] = []) {
-        this.history.push(...initialMessages)
+        for (const message of initialMessages) {
+            this.history.push(message.id ? message : { ...message, id: makeMessageId() })
+        }
     }
 
     get length(): number {
@@ -51,9 +67,10 @@ export class Memory implements IMemory {
     }
 
     add(message: IMessage): IMessage {
-        this.history.push(message)
-        this.notify(message)
-        return message
+        const stored = message.id ? message : { ...message, id: makeMessageId() }
+        this.history.push(stored)
+        this.notify(stored)
+        return stored
     }
 
     addUser(content: string): IMessage {

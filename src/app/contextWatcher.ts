@@ -34,7 +34,7 @@ export interface ICurrentTopic {
     topic: string
     /** entityKey(topic) — used for Entity.name graph lookup in Step 10. */
     key: string
-    /** Recent user messages that produced this topic. */
+    /** Recent user messages (chronological) that produced this topic. */
     evidence: string[]
     /** ISO timestamp of when the topic was computed. */
     observedAt: string
@@ -173,6 +173,11 @@ export class ContextWatcher {
         return this.relevantKnowledge
     }
 
+    /** The retriever bound to this watcher (Step 10), if any. */
+    public getRetriever(): KnowledgeRetriever | undefined {
+        return this.retriever
+    }
+
     /** Be notified whenever the current topic changes. Returns an unsubscribe. */
     public subscribe(listener: TopicListener): () => void {
         this.listeners.push(listener)
@@ -210,8 +215,13 @@ export class ContextWatcher {
     }
 
     /**
-     * Recompute the current topic from the recent history. When it changes,
-     * listeners are notified and the optional retriever (Step 10) is invoked.
+     * Recompute the current topic from the recent history. The snapshot (topic,
+     * evidence, observedAt) is ALWAYS refreshed so it reflects the LATEST
+     * messages — e.g. "I don't like coffee." then "Actually, I like coffee
+     * now." stays topic=coffee but must keep BOTH statements as evidence.
+     * Listeners are notified / the retriever is invoked only when the topic
+     * KEY actually changes, so the watcher never spams retrieves for the same
+     * topic.
      */
     public async tick(): Promise<void> {
         if (this.running || this.memory.length === 0) return
@@ -219,10 +229,12 @@ export class ContextWatcher {
         try {
             const recent = this.memory.getMessages().slice(-this.lookback)
             const topic = this.analyzer(recent)
-            const changed = !this.currentTopic || this.currentTopic.key !== topic.key
+            const keyChanged = !this.currentTopic || this.currentTopic.key !== topic.key
 
-            if (changed) {
-                this.currentTopic = topic
+            // Always store the freshly computed topic (latest evidence).
+            this.currentTopic = topic
+
+            if (keyChanged) {
                 this.notify(topic)
                 if (this.retriever && topic.key) {
                     this.relevantKnowledge = await this.retriever(topic, this.processor)

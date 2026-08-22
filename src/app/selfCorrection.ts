@@ -27,8 +27,9 @@
  */
 
 import type { IConflictFinding } from './conflictDetector.js'
-import type { IFeedback, FeedbackAction } from './feedbackEngine.js'
-import type { IQueryRunner } from './graphRetrieval.js'
+import { decideFeedback } from './feedbackEngine.js'
+import type { FeedbackAction } from './feedbackEngine.js'
+import type { IQueryRunner, IGraphQueryResult } from './graphRetrieval.js'
 import { GRAPH_NODE_LABELS, GRAPH_RELATIONSHIPS } from './graphSchema.js'
 
 /** The named self-correction rules applied by this engine. */
@@ -63,4 +64,112 @@ export interface ISelfCorrectionReport {
     text: string
 }
 
-// @PART2
+/**
+ * Build the parameterized Cypher that deletes one superseded relation edge.
+ * Fully parameterized — entity/predicate values are never inlined.
+ */
+function supersedeCypher(subject: string, predicate: string, object: string) {
+    return `\nMATCH (a:${GRAPH_NODE_LABELS.Entity} {name: $subject})` +
+        `-[r:${GRAPH_RELATIONSHIPS.RelatesTo} {predicate: $predicate}]` +
+        `->(b:${GRAPH_NODE_LABELS.Entity} {name: $object})\nDELETE r`
+}
+
+function describeRelation(subject: string, predicate: string, object: string): string {
+    return `${subject} ${predicate} ${object}`
+}
+
+/**
+ * SelfCorrectionEngine — Step 13 (self-correction rules).
+ *
+ * Given conflict findings from the ConflictDetector/FeedbackEngine, it decides,
+ * per the rules, whether to mutate the graph (delete a superseded historical
+ * edge) or keep both edges for user confirmation, and returns a "dynamic agent
+ * context" summary that is injected before the next LLM call.
+ */
+export class SelfCorrectionEngine {
+    private readonly runner: IQueryRunner
+
+    constructor(runner: IQueryRunner) {
+        this.runner = runner
+    }
+
+    /**
+     * Apply self-correction rules to a set of conflict findings. Finds an
+     * IQueryRunner for the graph, decides each feedback action, and executes
+     * the corresponding graph mutation (deletion) when warranted.
+     */
+    public async applyCorrections(
+        findings: readonly IConflictFinding[],
+    ): Promise<ISelfCorrectionReport> {
+        const corrections: ISelfCorrectionAction[] = []
+        let mutationsApplied = 0
+
+        for (const finding of findings) {
+            const feedback = decideFeedback(finding)
+
+            if (feedback.action === 'SUPERSEDED') {
+                // RULE_SUPERSEDE — the current statement is explicit and newer,
+                // so the contradicting HISTORICAL edges are removed. (The new
+                // relation was already written as a separate edge by the
+                // 3-minute extraction.)
+                for (const historical of finding.historical) {
+                    const cypher = supersedeCypher(finding.subject, historical.predicate, finding.object)
+                    const params: Record<string, unknown> = {
+                        subject: finding.subject,
+                        predicate: historical.predicate,
+                        object: finding.object,
+                    }
+                    await this.runner.run(cypher, params)
+                    mutationsApplied++
+                    corrections.push({
+                        rule: SELF_CORRECTION_RULES.Supersede,
+                        action: 'SUPERSEDED',
+                        description: `Removed superseded relation ${describeRelation(historical.subject, historical.predicate, historical.object)}`,
+                        cypher,
+                        params,
+                    })
+                }
+            } else {
+                // RULE_KEEP_CONFLICT (and RULE_INTERNAL_CONFLICT) — no explicit
+                // evidence in the current statement, so BOTH edges are kept in
+                // the graph and surfaced in the dynamic context for the user to
+                // confirm. No graph mutation.
+                const current = describeRelation(finding.subject, finding.current.predicate, finding.object)
+                const historicalList = finding.historical.map(h =>
+                    describeRelation(h.subject, h.predicate, h.object)).join(', ')
+                corrections.push({
+                    rule: SELF_CORRECTION_RULES.KeepConflict,
+                    action: 'CONFLICTING',
+                    description: `Kept conflicting relations for confirmation: ${current} vs ${historicalList} (no graph mutation)`,
+                })
+            }
+        }
+
+        const text = this.buildReportText(corrections)
+        return { corrections, mutationsApplied, text }
+    }
+
+    /** Render the dynamic agent context summary from the applied corrections. */
+    private buildReportText(corrections: readonly ISelfCorrectionAction[]): string {
+        if (corrections.length === 0) {
+            return '[Self-correction] No conflicts to correct.'
+        }
+
+        const lines: string[] = ['[Dynamic agent context - self-correction]']
+        for (const correction of corrections) {
+            lines.push(`- ${correction.rule}: ${correction.description}`)
+        }
+        return lines.join('\n')
+    }
+}
+
+/**
+ * Build a SelfCorrectionEngine from a store (or any object whose runQuery
+ * takes a parameterized query). Mirrors the createGraphKnowledgeRetriever
+ * adapter so a real Neo4jMemoryStore can drive the corrections.
+ */
+export function createSelfCorrectionEngine(runner: {
+    runQuery(query: string, params?: Record<string, unknown>): Promise<IGraphQueryResult>
+}): SelfCorrectionEngine {
+    return new SelfCorrectionEngine({ run: (query, params) => runner.runQuery(query, params) })
+}

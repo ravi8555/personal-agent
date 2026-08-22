@@ -37,6 +37,20 @@ export interface ITool {
 /** Alias kept for code subscribing to conversation messages. */
 export type Interceptor = MessageListener
 
+/** LLM message shape passed to the responder (role + content only). */
+export interface ILlmMessage {
+    role: string
+    content: string
+}
+
+/**
+ * Pluggable LLM seam. When set on the builder, `Agent.run()` uses this instead
+ * of the built-in OpenAI client — letting tests assert exactly what the LLM
+ * receives (e.g. that the running context with "ravi LIKES coffee" is inside
+ * the system prompt) and drive the response steps deterministically.
+ */
+export type AgentResponder = (messages: readonly ILlmMessage[]) => Promise<string | null>
+
 export class AgentBuilder {
     public instructions: string | undefined
     public toolList: ITool[]
@@ -45,6 +59,7 @@ export class AgentBuilder {
     public memoryStore: Neo4jMemoryStore | undefined
     public topicAnalyzer: TopicAnalyzer | undefined
     public knowledgeRetriever: KnowledgeRetriever | undefined
+    public responder: AgentResponder | undefined
 
     constructor() {
         this.toolList = []
@@ -104,6 +119,17 @@ export class AgentBuilder {
         return this
     }
 
+    /**
+     * Inject a custom LLM responder (test seam). When set, Agent.run() calls
+     * this instead of the OpenAI client — used by actual-agent tests to prove
+     * the running context (latest graph state) is injected into the system
+     * prompt and to drive deterministic response steps.
+     */
+    public withResponder(responder: AgentResponder) {
+        this.responder = responder
+        return this
+    }
+
     public build() {
         return new Agent(this)
     }
@@ -119,6 +145,7 @@ export class Agent {
     private readonly memoryStore: Neo4jMemoryStore | undefined
     private readonly topicAnalyzer: TopicAnalyzer | undefined
     private readonly knowledgeRetriever: KnowledgeRetriever | undefined
+    private readonly responder: AgentResponder | undefined
     private readonly memoryExtractions: IMemoryExtraction[] = []
     private readonly openai: Openai
     public readonly toolMap: Map<string, ITool>
@@ -165,6 +192,9 @@ export class Agent {
         // Optional custom graph retriever (Step 10); falls back to a
         // store-backed retriever when no custom one is provided.
         this.knowledgeRetriever = builder.knowledgeRetriever
+
+        // Optional custom LLM responder (test seam); falls back to OpenAI.
+        this.responder = builder.responder
     }
 
     /** The memory / conversation-history backing this agent. */
@@ -242,16 +272,6 @@ export class Agent {
     private resolveKnowledgeRetriever(): KnowledgeRetriever | undefined {
         if (this.knowledgeRetriever) return this.knowledgeRetriever
         return this.memoryStore ? createGraphKnowledgeRetriever(this.memoryStore) : undefined
-    }
-
-    /** Detect the current conversation topic from recent user messages. */
-    private detectCurrentTopic(): ICurrentTopic {
-        const userMessages = this.memory.getMessages()
-            .filter(message => message.role === 'user')
-            .slice(-3)
-        const analyzer = this.topicAnalyzer ?? defaultTopicAnalyzer
-        const recent = userMessages.length > 0 ? userMessages : this.memory.getMessages()
-        return analyzer(recent)
     }
 
     /**
