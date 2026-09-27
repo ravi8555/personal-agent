@@ -11,7 +11,9 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "echo \"Error: no test specified\" && exit 1",
     "test:connection": "node --env-file=.env --import tsx src/tests/test-connection.ts",
-    "test:neo4j": "node --env-file=.env --import tsx src/tests/neo4jMemoryStore-test.ts"
+    "test:neo4j": "node --env-file=.env --import tsx src/tests/neo4jMemoryStore-test.ts",
+    "test:intent": "node --import tsx src/tests/intent-engine-test.ts && node --import tsx src/tests/intent-agent-wiring-test.ts",
+    "test:planner": "node --import tsx src/tests/planning-engine-test.ts"
   },
   "devDependencies": {
     "@types/node": "^26.2.0",

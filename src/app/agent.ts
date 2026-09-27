@@ -2,6 +2,12 @@ import { log } from "node:console"
 import { HARNESS_PROMPTS } from "./config.js"
 import { detectIntent } from "./intentEngine.js"
 import type { IIntentResult, IntentDetector } from "./intentEngine.js"
+import { Planner } from "./planner.js"
+import { PlanExecutor } from "./planExecutor.js"
+import type { IPlanExecutionResult } from "./planExecutor.js"
+import { buildDynamicContext } from "./dynamicContext.js"
+import { createDefaultToolRegistry, ToolRegistry } from "./toolRegistry.js"
+import type { IPlan, IPlanStep } from "./planTypes.js"
 import { Memory } from "./memory.js"
 import { MemoryProcessor } from "./memoryProcessor.js"
 import { MemoryScheduler } from "./memoryScheduler.js"
@@ -63,6 +69,9 @@ export class AgentBuilder {
     public knowledgeRetriever: KnowledgeRetriever | undefined
     public responder: AgentResponder | undefined
     public intentDetector: IntentDetector | undefined
+    public planner: Planner | undefined
+    public planExecutor: PlanExecutor | undefined
+    public toolRegistry: ToolRegistry | undefined
 
     constructor() {
         this.toolList = []
@@ -143,6 +152,24 @@ export class AgentBuilder {
         return this
     }
 
+    /** Phase 2: register tools the planner/executor may call (MCP-ready). */
+    public withToolRegistry(registry: ToolRegistry) {
+        this.toolRegistry = registry
+        return this
+    }
+
+    /** Phase 2: inject a custom structured planner (LLM or rule-based). */
+    public withPlanner(planner: Planner) {
+        this.planner = planner
+        return this
+    }
+
+    /** Phase 2: inject a custom plan executor (tests / custom runtimes). */
+    public withPlanExecutor(executor: PlanExecutor) {
+        this.planExecutor = executor
+        return this
+    }
+
     public build() {
         return new Agent(this)
     }
@@ -167,6 +194,12 @@ export class Agent {
      * RunningContext → LLM pipeline is unchanged; tasks are NOT executed.
      */
     private lastIntent: IIntentResult | null = null
+    private readonly planner: Planner | undefined
+    private readonly planExecutor: PlanExecutor | undefined
+    private readonly toolRegistry: ToolRegistry
+    /** Phase 2: last plan + execution result (in-memory, never in Neo4j). */
+    private lastPlan: IPlan | null = null
+    private lastPlanResult: IPlanExecutionResult | null = null
     private readonly memoryExtractions: IMemoryExtraction[] = []
     private readonly openai: Openai
     public readonly toolMap: Map<string, ITool>
@@ -217,6 +250,18 @@ export class Agent {
         // Optional custom LLM responder (test seam); falls back to OpenAI.
         this.responder = builder.responder
         this.intentDetector = builder.intentDetector ?? detectIntent
+
+        // Phase 2: planning engine. Tools come from an injectable registry
+        // (defaults to the local demo registry; MCP tools plug in here in
+        // Phase 3). The planner prefers an LLM when a key is configured and
+        // always falls back to a deterministic rule-based plan otherwise.
+        this.toolRegistry = builder.toolRegistry ?? createDefaultToolRegistry()
+        const llmPlannerHook = this.createLlmPlannerHook()
+        this.planner = builder.planner ?? new Planner({
+            knownTools: this.toolRegistry.names(),
+            ...(llmPlannerHook ? { generatePlan: llmPlannerHook } : {}),
+        })
+        this.planExecutor = builder.planExecutor ?? new PlanExecutor(this.toolRegistry)
     }
 
     /** The memory / conversation-history backing this agent. */
@@ -424,6 +469,21 @@ export class Agent {
         return this.lastIntent
     }
 
+    /** Phase 2: last plan produced for a task turn (in-memory only). */
+    public getLastPlan(): IPlan | null {
+        return this.lastPlan
+    }
+
+    /** Phase 2: last plan execution result (in-memory only). */
+    public getLastPlanResult(): IPlanExecutionResult | null {
+        return this.lastPlanResult
+    }
+
+    /** Phase 2: the tool registry backing planner + executor (MCP-ready). */
+    public getToolRegistry(): ToolRegistry {
+        return this.toolRegistry
+    }
+
     static builder() {
         return new AgentBuilder()
     }
@@ -436,12 +496,10 @@ export class Agent {
         // Record the user query in the conversation memory.
         this.memory.addUser(query)
 
-        // Step 10b (Phase 1): classify — informational only. The pipeline
-        // below is unchanged; tasks are NOT executed (planner stub logs).
+        // Step 10b: classify the turn (Phase 1 rules, unchanged).
         this.lastIntent = this.intentDetector(query)
-        if (this.lastIntent.type === "task") {
-            log(`[IntentEngine] Task detected. Planning deferred to Phase 2.`)
-        }
+        this.lastPlan = null
+        this.lastPlanResult = null
 
         // Step 11: pull relevant graph knowledge for the current topic and make
         // it part of the "running context" of the next LLM call. Guarded so a
@@ -454,14 +512,33 @@ export class Agent {
             runningContext = null
         }
 
+        // Step 11b (Phase 2): Task intent + confidence >= threshold moves along
+        // the planning path: Planner → IPlan → PlanExecutor → Tools → Results.
+        // Question/Conversation keep the unchanged retrieval + memory path.
+        let planningNote: string | null = null
+        if (this.lastIntent.type === "task") {
+            planningNote = await this.runTaskPlan(query, this.lastIntent, runningContext)
+        }
+
+        // Dynamic context: Memory Engine ("what do I know") + Planning Engine
+        // ("what should I do" / "what happened") as labelled sections, so the
+        // LLM reports real execution results instead of pretending.
+        const dynamicContext = buildDynamicContext({
+            runningContext,
+            intent: this.lastIntent,
+            plan: this.lastPlan,
+            execution: this.lastPlanResult,
+            planningNote,
+        })
         
 
         for (let i = 0; i < this.MAX_LOOP; i++) {
-            // Step C: inject the running context into the system prompt itself,
+            // Step C: inject the dynamic context into the system prompt itself,
             // immediately before the LLM call — so the base instructions are
-            // never replaced, only augmented with the latest relevant knowledge.
-            const systemContent = runningContext
-                ? `${this.instructions}\n\n${runningContext}`
+            // never replaced, only augmented with labelled memory + execution
+            // sections from the Memory and Planning engines.
+            const systemContent = dynamicContext
+                ? `${this.instructions}\n\n${dynamicContext}`
                 : this.instructions
 
             const messages: Array<{ role: 'system' | 'user' | 'assistant' | 'developer'; content: string }> = [
@@ -504,6 +581,76 @@ export class Agent {
                     toolResult
                 }))
             }
+        }
+    }
+
+    /**
+     * Phase 2 — Task route: Intent(task) → Planner → IPlan → PlanExecutor →
+     * Tools → Results. Sets {@link lastPlan} / {@link lastPlanResult} which the
+     * dynamic context then renders as [Current task] / [Execution].
+     *
+     * Returns a clarification note when no plan could be established, otherwise
+     * `null`. Never throws: a planner/executor failure degrades to the normal
+     * retrieval + memory path so the conversation is never broken.
+     */
+    private async runTaskPlan(
+        query: string,
+        intent: IIntentResult,
+        runningContext: string | null,
+    ): Promise<string | null> {
+        if (!this.planner || !this.planExecutor) return null
+
+        try {
+            const planned = await this.planner.createPlan({
+                goal: query,
+                intent,
+                context: runningContext,
+            })
+
+            if (!planned.plan) {
+                log(`[Planner] No plan for this task (reason: ${planned.reason}). Asking for clarification.`)
+                if (planned.reason === "llm-unavailable") {
+                    return "No LLM planner is configured for this deployment, so the task cannot be planned automatically."
+                }
+                if (planned.reason === "invalid-plan") {
+                    return [
+                        "The generated plan failed structural validation and was rejected.",
+                        ...(planned.errors ?? []).slice(0, 3).map(e => `Validation error: ${e}`),
+                    ].join("\n")
+                }
+                return "The task could not be planned automatically. Ask the user a short clarifying question instead of guessing."
+            }
+
+            this.lastPlan = planned.plan
+            log(`[Planner] Plan ${planned.plan.id} created (source: ${planned.source ?? "unknown"}) with ${planned.plan.steps.length} step(s).`)
+
+            const result = await this.planExecutor.execute(planned.plan)
+            this.lastPlanResult = result
+            log(`[PlanExecutor] Plan ${result.planId} finished: ${result.status}.`)
+
+            return null
+        } catch (error) {
+            log(`[Planner] Planning failed, continuing without a plan: ${error instanceof Error ? error.message : String(error)}`)
+            return null
+        }
+    }
+
+    /**
+     * LLM planner hook. Returns undefined when no OpenAI key is configured, so
+     * the Planner uses its deterministic rule-based fallback (this is also the
+     * path unit tests take — no network, no API key needed).
+     */
+    private createLlmPlannerHook(): ((prompt: string) => Promise<string | null>) | undefined {
+        // A responder seam means the caller wants a fully deterministic agent
+        // (tests / custom runtimes) — keep planning deterministic too.
+        if (this.responder) return undefined
+        if (!process.env.OPENAI_API_KEY) return undefined
+        return async (prompt: string) => {
+            const response = await this.openai.chat.completions.create({
+                model: 'gpt-4o',
+                messages: [{ role: 'user', content: prompt }],
+            })
+            return response.choices[0]?.message.content ?? null
         }
     }
 

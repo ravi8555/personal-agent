@@ -81,3 +81,5 @@ assert.ok(fallback.confidence < moderate.confidence && moderate.confidence < str
 console.log(`  PASS confidence bands: strong=${strong.confidence} moderate=${moderate.confidence} fallback=${fallback.confidence}`);
 
 console.log(`\n✅ Intent Engine: ${passed}/${CASES.length} cases passed.`);
+
+// npm exec tsx src/tests/intent-engine-test.ts

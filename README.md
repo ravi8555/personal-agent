@@ -1,6 +1,10 @@
 # NeuroGraph — Personal AI Assistant
 
-A stateful, graph-augmented personal AI assistant that builds a persistent, long-term memory of the user over time. Unlike standard conversational bots whose memory is lost across sessions or compressed into lossy flat summaries, **NeuroGraph** continuously extracts atomic facts, relations, and feedback from dialogue into an evolving property graph powered by **Neo4j**, performs proactive conflict detection and self-correction, dynamically injects relevant running context into the system prompt, and features a clean, isolated frontend UI.
+A memory-aware personal AI agent with deterministic intent detection, LLM-assisted task planning, validated execution plans, and extensible tool execution.
+
+**NeuroGraph** builds a persistent, long-term memory of the user over time. Unlike standard conversational bots whose memory is lost across sessions or compressed into lossy flat summaries, it continuously extracts atomic facts, relations, and feedback from dialogue into an evolving property graph powered by **Neo4j**, performs proactive conflict detection and self-correction, dynamically injects relevant running context into the system prompt, and features a clean, isolated frontend UI.
+
+The design keeps two engines strictly separate — the **Memory Engine** answers *"what do I know?"* and the **Planning Engine** answers *"what should I do?"* — and they meet only in the labelled dynamic context handed to the LLM.
 
 ## How It Works (Current App)
 
@@ -30,6 +34,30 @@ Agent (A: memory, B: context watcher, C: running context → system prompt, D: E
 LLM (response)
 ```
 
+With Phases 1 + 2 the Agent turn is now routed:
+
+```
+User message
+     ↓
+Memory.addUser()
+     ↓
+Intent Detection (Phase 1)
+     ↓
+┌──────────────┬───────────────┬────────────────┐
+│ Question     │ Task          │ Conversation   │
+└──────┬───────┴──────┬────────┴───────┬────────┘
+       ↓              ↓                ↓
+  Retrieval +     Planner          Memory
+  Context + LLM   (Phase 2)        Pipeline
+                  ↓
+                IPlan → PlanExecutor → Tools
+                  ↓
+            Dynamic Context
+  [Relevant memory] / [Current task] / [Execution]
+                  ↓
+                 LLM
+```
+
 ### Preference-change loop (conflict resolution)
 
 ```
@@ -52,18 +80,144 @@ LIKES becomes current knowledge
 
 Done so far: A — Agent → Memory ✅ · B — Agent → ContextWatcher ✅ ·
 C — Running Context → LLM ✅ · D — Actual Agent E2E ✅ ·
-Memory conflict resolution ✅ · Self correction ✅ · Neo4j graph ✅
+Memory conflict resolution ✅ · Self correction ✅ · Neo4j graph ✅ ·
+Phase 1 Intent Engine ✅ · Phase 2 Planning Engine ✅
+
+## Phase 1 — Intent Engine
+
+`src/app/intentEngine.ts` (pure, deterministic, no LLM, no I/O):
+
+```
+User message
+     ↓
+Memory.addUser()
+     ↓
+Intent Detection                     ← Phase 1
+     ↓
+┌──────────────┬───────────────┬────────────────┐
+│ Question     │ Task          │ Conversation   │
+└──────┬───────┴──────┬────────┴───────┬────────┘
+       ↓              ↓                ↓
+  Retrieval +     Planner           Memory
+  Context + LLM   (Phase 2)         Pipeline
+```
+
+- **Three intents only:** `question | task | conversation` — plus rich `signals`
+  (`memory-query`, `correction`, `preference`, `explicit-preference`,
+  `personal-fact`, `greeting`, `acknowledgement`, `opinion`, `purchase-intent`,
+  `recommendation-request`, `imperative:*`, `help-me-*`, `reminder-request`, …).
+- **`IIntentResult { type, confidence, signals, raw }`** — `confidence` is a
+  rule-engine score, not a probability: strong 0.90–0.97, moderate 0.75–0.89,
+  fallback conversation 0.60–0.74.
+- **Priority:** task > question > conversation, with two guards:
+  a *memory-query* ("Do you remember…", "Remind me what…") always resolves to
+  `question`, and a *correction* sentence ("Actually, I like coffee now.")
+  can never leak into task/question — the conflict/self-correction pipeline is
+  untouched.
+- **Classification only, no routing.** Exposed via `agent.getLastIntent()` and
+  injectable via `AgentBuilder.withIntentDetector()`.
+
+## Phase 2 — Planning Engine
+
+Plans are **transient, in-memory execution state** — the Planning Engine answers
+*"what should I do?"* while the Memory Engine keeps answering *"what do I know?"*.
+Neither owns the other.
+
+```
+Intent(task) + confidence ≥ 0.75
+            ↓
+         Planner  (LLM structured JSON, strict schema)   ← src/app/planner.ts
+            ↓
+          IPlan   (id, goal, steps[], createdAt, status) ← src/app/planTypes.ts
+            ↓
+       planValidator (ids, deps, cycles, tools, args)    ← src/app/planValidator.ts
+            ↓
+        PlanExecutor (dependency order, fail → skip)     ← src/app/planExecutor.ts
+            ↓
+        ToolRegistry (MCP-ready seam)                    ← src/app/toolRegistry.ts
+            ↓
+   Dynamic Context ([Relevant memory]/[Current task]/[Execution])
+            ↓
+                        LLM
+```
+
+### Step kinds (planner reasoning vs. agent/LLM reasoning)
+
+Every step carries a `kind` so the executor never conflates the two:
+
+| kind | Meaning | Resolved by |
+| ---- | ------- | ----------- |
+| `tool` | external capability (MCP in Phase 3) | `ToolRegistry` |
+| `decision` | planner-side judgement: pick/filter/score | planner layer |
+| `action` | agent-side action, no external tool | agent layer |
+| `response` | final prose — **owned by the LLM** | LLM (executor only records intent) |
+
+`resolveStepKind()` infers the kind when a plan omits it (tool → `tool`,
+"report/respond…" → `response`, else `decision`).
+
+### Planner result metadata
+
+```ts
+interface IPlannerResult {
+  plan: IPlan | null;
+  reason: "ok" | "below-threshold" | "not-a-task" | "invalid-plan" | "llm-unavailable";
+  source?: "llm" | "fallback";   // which planner actually produced the plan
+  errors?: string[];
+}
+```
+
+LLM success → `ok` / `source: "llm"` · LLM missing, failing or structurally
+invalid → deterministic plan with `ok` / `source: "fallback"` (the degradation is
+explicit for debugging) · neither produces a valid plan → `invalid-plan`.
+Strict mode (`new Planner({ requireLlm: true })`) returns `llm-unavailable`
+instead of silently degrading.
+
+### Dynamic context
+
+`src/app/dynamicContext.ts` is the single seam where the two engines meet:
+
+```
+[Relevant memory]      ← Memory Engine (RunningContext, embedded verbatim)
+- ravi LIKES coffee
+
+[Current task]         ← Planning Engine
+- Goal: Find a coffee machine
+- Plan: plan-… (4 step(s), now completed)
+
+[Execution]            ← what actually happened (kind/tool tagged)
+- Search for coffee machines — done (tool "web.search"): {...}
+- Plan outcome: completed
+
+[Instruction]
+- Use the execution results above to formulate the final response.
+- Only describe actions that appear under [Execution]; never invent tool output.
+```
+
+So the LLM reports real execution results instead of pretending it did the work.
+
+### Trigger & safety rules
+
+- **Trigger gate:** Task intent **and** `confidence >= TASK_PLAN_THRESHOLD (0.75)`.
+  Below the threshold the agent asks for clarification instead of guessing;
+  question/conversation never reach the planner.
+- **LLM proposes, the application disposes:** `planValidator` rejects duplicate
+  ids, missing/cyclic dependencies, unknown tools and missing required args.
+- **The LLM never executes tools** — only `PlanExecutor` calls the registry.
+- **Deterministic by default in tests:** injecting `withResponder()` disables the
+  LLM planner hook, so unit tests need no API key and no network.
+- Seams: `withPlanner()`, `withPlanExecutor()`, `withToolRegistry()`, plus
+  `getLastPlan()`, `getLastPlanResult()`, `getToolRegistry()`.
 
 ## Phase-wise Roadmap
 
-| Phase | Name | Scope |
-| ----- | ---- | ----- |
-| 1 | Intent Engine | Classify each message: Question (`"What is..."`) vs Task (`"Create..."`) vs Conversation (`"I like..."`); route Question → retrieval+LLM, Task → planner, Conversation → memory pipeline |
-| 2 | Planning Engine | Multi-step plans from tasks (planner → steps → tool calls) |
-| 3 | MCP Tool Layer | Gmail / Calendar / GitHub tools behind one MCP interface |
-| 4 | Action + Memory | Execute actions, store results back into the graph |
-| 5 | User Preferences | Durable preference model with precedence over generic facts |
-| 6 | Proactive Agent | Scheduled nudges from graph state + feedback loop |
+| Phase | Name | Scope | Status |
+| ----- | ---- | ----- | ------ |
+| 1 | Intent Engine | Question / Task / Conversation + signals; classification only | ✅ Done |
+| 2 | Planning Engine | `IPlan` + dependencies, validator, executor, MCP-ready tool registry | ✅ Done |
+| 3 | MCP Tool Layer | Gmail / Calendar / GitHub tools behind one MCP interface | Next |
+| 4 | Action + Memory | Execute actions, store results back into the graph | Planned |
+| 5 | User Preferences | Durable preference model with precedence over generic facts | Planned |
+| 6 | Proactive Agent | Scheduled nudges from graph state + feedback loop | Planned |
 
 Target shape:
 
@@ -249,11 +403,18 @@ Personal-Agent/
 │   │   ├── graphNormalization.ts # Canonicalization for predicates & entities
 │   │   ├── graphRetrieval.ts  # Graph traversal and retrieval algorithms
 │   │   ├── graphSchema.ts     # Schema definitions and DDL initialization
+│   │   ├── dynamicContext.ts  # Phase 2: labelled dynamic context (memory/task/execution/instruction)
 │   │   ├── graphStore.ts      # Neo4j database driver and session management
+│   │   ├── intentEngine.ts    # Phase 1: Intent classification (question/task/conversation) + signals
 │   │   ├── memory.ts          # Conversation turn history management
 │   │   ├── memoryExtraction.ts# LLM-based structured extraction
 │   │   ├── memoryProcessor.ts # Pipeline orchestrator for turn extraction
 │   │   ├── memoryScheduler.ts # Scheduled processor trigger
+│   │   ├── planner.ts         # Phase 2: LLM-backed structured planner (+ deterministic fallback)
+│   │   ├── planTypes.ts       # Phase 2: IPlan / IPlanStep / statuses / threshold
+│   │   ├── planValidator.ts   # Phase 2: deterministic plan validator (ids, deps, cycles, tools, args)
+│   │   ├── planExecutor.ts    # Phase 2: dependency-ordered executor (fail → skip dependents)
+│   │   ├── toolRegistry.ts    # Phase 2: tool registry (MCP-ready seam for Phase 3)
 │   │   ├── runningContext.ts  # System prompt context builder
 │   │   └── selfCorrection.ts  # Graph update logic for resolving conflicts
 │   └── tests/                 # Unit, integration, and E2E test suites
@@ -368,6 +529,8 @@ OPENAI_API_KEY=sk-...
 | `npm run typecheck` | Type-checks the backend codebase using `tsconfig.json` |
 | `npm run test:connection` | Tests Neo4j connectivity using credentials in `.env` |
 | `npm run test:neo4j` | Runs the Neo4j memory store test suite |
+| `npm run test:intent` | Runs the Phase 1 Intent Engine + Agent wiring tests |
+| `npm run test:planner` | Runs the Phase 2 Planning Engine test suite |
 
 ### Frontend (`frontend/`)
 
@@ -387,6 +550,14 @@ Test scripts for backend subsystems are located in `src/tests/` and can be run u
 - **Neo4j Connectivity:**
   ```bash
   npm run test:connection
+  ```
+- **Phase 1 — Intent Engine (no Neo4j / OpenAI needed):**
+  ```bash
+  npm run test:intent
+  ```
+- **Phase 2 — Planning Engine (no Neo4j / OpenAI needed):**
+  ```bash
+  npm run test:planner
   ```
 - **Store Operations:**
   ```bash
