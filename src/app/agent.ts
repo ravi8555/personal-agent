@@ -1,5 +1,7 @@
 import { log } from "node:console"
 import { HARNESS_PROMPTS } from "./config.js"
+import { detectIntent } from "./intentEngine.js"
+import type { IIntentResult, IntentDetector } from "./intentEngine.js"
 import { Memory } from "./memory.js"
 import { MemoryProcessor } from "./memoryProcessor.js"
 import { MemoryScheduler } from "./memoryScheduler.js"
@@ -60,6 +62,7 @@ export class AgentBuilder {
     public topicAnalyzer: TopicAnalyzer | undefined
     public knowledgeRetriever: KnowledgeRetriever | undefined
     public responder: AgentResponder | undefined
+    public intentDetector: IntentDetector | undefined
 
     constructor() {
         this.toolList = []
@@ -130,6 +133,16 @@ export class AgentBuilder {
         return this
     }
 
+    /**
+     * Step 10b seam (Phase 1): inject a custom intent classifier.
+     * Defaults to the rule-based `detectIntent` — pure classification,
+     * no routing, no side effects.
+     */
+    public withIntentDetector(detector: IntentDetector) {
+        this.intentDetector = detector
+        return this
+    }
+
     public build() {
         return new Agent(this)
     }
@@ -146,6 +159,14 @@ export class Agent {
     private readonly topicAnalyzer: TopicAnalyzer | undefined
     private readonly knowledgeRetriever: KnowledgeRetriever | undefined
     private readonly responder: AgentResponder | undefined
+    private readonly intentDetector: IntentDetector
+
+    /**
+     * Latest classification from Step 10b (null until the first `run()`).
+     * Phase 1: informational only — Memory → ContextWatcher → Retriever →
+     * RunningContext → LLM pipeline is unchanged; tasks are NOT executed.
+     */
+    private lastIntent: IIntentResult | null = null
     private readonly memoryExtractions: IMemoryExtraction[] = []
     private readonly openai: Openai
     public readonly toolMap: Map<string, ITool>
@@ -195,6 +216,7 @@ export class Agent {
 
         // Optional custom LLM responder (test seam); falls back to OpenAI.
         this.responder = builder.responder
+        this.intentDetector = builder.intentDetector ?? detectIntent
     }
 
     /** The memory / conversation-history backing this agent. */
@@ -276,16 +298,22 @@ export class Agent {
 
     /**
      * Step 11: assemble the running context — relevant graph knowledge for the
-     * current topic, formatted for injection into the next LLM call. Returns
-     * null when no retriever is configured, so this is safe to call with no
-     * graph store wired up.
+     * current topic, formatted for injection into the next LLM call. Routes
+     * through the ContextWatcher chain (Agent → ContextWatcher →
+     * GraphKnowledgeRetriever → buildRunningContext) so the topic evidence is
+     * fresh and the retriever is the watcher's own. Returns null when no
+     * retriever is configured, so this is safe to call with no graph store
+     * wired up.
      */
     public async buildRunningContext(): Promise<IRunningContext | null> {
-        const retriever = this.resolveKnowledgeRetriever()
+        const watcher = this.getContextWatcher()
+        const retriever = watcher.getRetriever()
         if (!retriever) return null
 
-        const topic = this.detectCurrentTopic()
-        if (!topic.key) return null
+        // Refresh the current topic via the watcher (keeps evidence fresh).
+        await watcher.tick()
+        const topic = watcher.getCurrentTopic()
+        if (!topic || !topic.key) return null
 
         const knowledge = (await retriever(topic, this.memoryProcessor)) as IRelevantKnowledge | null
         const running = buildRunningContext(topic, knowledge)
@@ -391,6 +419,11 @@ export class Agent {
         return this.memory.subscribe(interceptor)
     }
 
+    /** Latest Step 10b classification (null until the first `run()`). */
+    public getLastIntent(): IIntentResult | null {
+        return this.lastIntent
+    }
+
     static builder() {
         return new AgentBuilder()
     }
@@ -402,6 +435,13 @@ export class Agent {
     public async run(query: string): Promise<readonly IMessage[] | undefined> {
         // Record the user query in the conversation memory.
         this.memory.addUser(query)
+
+        // Step 10b (Phase 1): classify — informational only. The pipeline
+        // below is unchanged; tasks are NOT executed (planner stub logs).
+        this.lastIntent = this.intentDetector(query)
+        if (this.lastIntent.type === "task") {
+            log(`[IntentEngine] Task detected. Planning deferred to Phase 2.`)
+        }
 
         // Step 11: pull relevant graph knowledge for the current topic and make
         // it part of the "running context" of the next LLM call. Guarded so a
@@ -417,26 +457,25 @@ export class Agent {
         
 
         for (let i = 0; i < this.MAX_LOOP; i++) {
-            const messages: Array<{ role: 'system' | 'user' | 'assistant' | 'developer'; content: string }> = [
-                { role: 'system', content: this.instructions },
-            ]
+            // Step C: inject the running context into the system prompt itself,
+            // immediately before the LLM call — so the base instructions are
+            // never replaced, only augmented with the latest relevant knowledge.
+            const systemContent = runningContext
+                ? `${this.instructions}\n\n${runningContext}`
+                : this.instructions
 
-            // Relevant graph knowledge (Step 11) only when something was retrieved.
-            if (runningContext) {
-                messages.push({ role: 'developer', content: runningContext })
-            }
+            const messages: Array<{ role: 'system' | 'user' | 'assistant' | 'developer'; content: string }> = [
+                { role: 'system', content: systemContent },
+            ]
 
             // Full short-term message history.
             messages.push(
                 ...this.memory.getMessages().map(e => ({ role: e.role, content: e.content })),
             )
 
-            const llmResponse = await this.openai.chat.completions.create({
-                model: 'gpt-4o',
-                messages,
-            })
+            const llmResponse = await this.callLlm(messages)
 
-            const rawLLMResponse: string | null = llmResponse.choices[0]?.message.content ?? null
+            const rawLLMResponse: string | null = llmResponse
 
             // Remember the assistant message.
             if (rawLLMResponse === null) break
@@ -466,5 +505,25 @@ export class Agent {
                 }))
             }
         }
+    }
+
+    /**
+     * Call the LLM for one iteration. Uses the injected responder/OpenAI seam
+     * ({@link AgentBuilder.withResponder}) when available, otherwise the
+     * built-in OpenAI client. `messages` are the full system + history array,
+     * and the responder receives a lightweight (role, content) form.
+     */
+    private async callLlm(
+        messages: ReadonlyArray<{ role: string; content: string }>,
+    ): Promise<string | null> {
+        if (this.responder) {
+            return this.responder(messages)
+        }
+
+        const llmResponse = await this.openai.chat.completions.create({
+            model: 'gpt-4o',
+            messages: messages as unknown as Array<import('openai/resources/chat/completions/completions.js').ChatCompletionMessageParam>,
+        })
+        return llmResponse.choices[0]?.message.content ?? null
     }
 }

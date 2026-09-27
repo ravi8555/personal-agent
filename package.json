@@ -10,11 +10,12 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "echo \"Error: no test specified\" && exit 1",
-    "test:connection": "node --env-file=.env --loader tsx src/tests/test-connection.ts",
-    "test:neo4j": "node --env-file=.env --loader tsx src/tests/neo4jMemoryStore-test.ts"
+    "test:connection": "node --env-file=.env --import tsx src/tests/test-connection.ts",
+    "test:neo4j": "node --env-file=.env --import tsx src/tests/neo4jMemoryStore-test.ts"
   },
   "devDependencies": {
     "@types/node": "^26.2.0",
+    "tsx": "^4.19.0",
     "typescript": "^5.9.3"
   },
   "dependencies": {

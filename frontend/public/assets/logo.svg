@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="NeuroGraph logo">
+  <defs>
+    <linearGradient id="ngGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#6366f1"/>
+      <stop offset="55%" stop-color="#8b5cf6"/>
+      <stop offset="100%" stop-color="#22d3ee"/>
+    </linearGradient>
+    <linearGradient id="ngGradSoft" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#6366f1" stop-opacity="0.25"/>
+      <stop offset="100%" stop-color="#22d3ee" stop-opacity="0.12"/>
+    </linearGradient>
+  </defs>
+
+  <!-- rounded-square canvas -->
+  <rect x="24" y="24" width="464" height="464" rx="104" fill="url(#ngGradSoft)"/>
+
+  <!-- node graph: 3 hubs connected by edges -->
+  <g stroke="url(#ngGrad)" stroke-width="14" stroke-linecap="round">
+    <line x1="160" y1="150" x2="262" y2="256"/>
+    <line x1="262" y1="256" x2="360" y2="356"/>
+    <line x1="160" y1="150" x2="360" y2="356"/>
+    <line x1="360" y1="356" x2="168" y2="368"/>
+  </g>
+
+  <g fill="url(#ngGrad)">
+    <circle cx="160" cy="150" r="34"/>
+    <circle cx="262" cy="256" r="38"/>
+    <circle cx="360" cy="356" r="34"/>
+    <circle cx="248" cy="368" r="26"/>
+  </g>
+
+  <!-- node highlights -->
+  <g fill="#ffffff" opacity="0.9">
+    <circle cx="150" cy="140" r="9"/>
+    <circle cx="251" cy="245" r="10"/>
+    <circle cx="350" cy="347" r="9"/>
+    <circle cx="242" cy="362" r="7"/>
+  </g>
+</svg>
