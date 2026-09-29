@@ -1,18 +1,31 @@
 /**
- * Phase 2 — ToolRegistry (MCP-ready seam for Phase 3).
+ * Phase 2/3 — ToolRegistry: the abstraction over ALL tools (3.6).
  *
- * Today: an in-process registry of named tools with JSON-schema-light arg
- * requirements + a couple of built-in demo tools. In Phase 3 this becomes
- * the bridge to MCP tools (Gmail / Calendar / GitHub) and web tools —
- * planner + validator + executor keep talking to THIS interface, so no
- * Agent redesign is needed when real tools land.
+ * Local tools and MCP tools register here in identical shape — the planner,
+ * validator and executor never branch on where a tool comes from; they only
+ * ever call `registry.execute(step.tool, step.args)`. MCP discovery
+ * (src/app/mcp/mcpToolDiscovery.ts) registers adapters into this registry,
+ * and `listTools()` feeds the planner's knownTools (3.4).
  */
 
 export interface IToolDefinition {
     name: string;
     description: string;
     requiredArgs?: string[];
+    /** Where the tool comes from. Local (default) or an MCP server. */
+    source?: "local" | "mcp";
+    /** MCP server id when source === "mcp". */
+    server?: string;
     executor: (args: Record<string, unknown>) => Promise<unknown>;
+}
+
+/** Tool descriptor exposed to the planner (3.3/3.4 knownTools source). */
+export interface IToolInfo {
+    name: string;
+    description: string;
+    requiredArgs: string[];
+    source: "local" | "mcp";
+    server?: string;
 }
 
 export class ToolRegistry {
@@ -39,6 +52,20 @@ export class ToolRegistry {
 
     public names(): string[] {
         return [...this.tools.keys()];
+    }
+
+    /**
+     * Full tool descriptors (3.3) — the discovery feed for the Planner:
+     * MCP servers → tool discovery → ToolRegistry → listTools() → knownTools.
+     */
+    public listTools(): IToolInfo[] {
+        return [...this.tools.values()].map(tool => ({
+            name: tool.name,
+            description: tool.description,
+            requiredArgs: tool.requiredArgs ?? [],
+            source: tool.source ?? "local",
+            ...(tool.server !== undefined ? { server: tool.server } : {}),
+        }));
     }
 
     public requiredArgs(name: string): string[] {

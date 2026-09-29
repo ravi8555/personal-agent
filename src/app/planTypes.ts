@@ -9,8 +9,13 @@
  * may be persisted later via the existing memory pipeline.
  */
 
-/** Lifecycle of a single step. */
-export type PlanStepStatus = "pending" | "running" | "completed" | "failed";
+/**
+ * Lifecycle of a single step. "skipped" means the step never ran because a
+ * dependency did not complete (failed, or was itself skipped) — the plan's
+ * internal state now matches the "skipped" IStepResult the executor records,
+ * so there is no more failed/skipped mismatch.
+ */
+export type PlanStepStatus = "pending" | "running" | "completed" | "failed" | "skipped";
 
 /** Lifecycle of a whole plan. */
 export type PlanStatus = "pending" | "running" | "completed" | "failed";

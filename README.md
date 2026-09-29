@@ -208,13 +208,103 @@ So the LLM reports real execution results instead of pretending it did the work.
 - Seams: `withPlanner()`, `withPlanExecutor()`, `withToolRegistry()`, plus
   `getLastPlan()`, `getLastPlanResult()`, `getToolRegistry()`.
 
+## Phase 3 — MCP Tool Layer
+
+MCP (Model Context Protocol) is an **infrastructure/capability layer
+underneath the existing ToolRegistry** — not a replacement for the Planner or
+the Agent. MCP provides capabilities; the Planner decides when those
+capabilities are needed.
+
+```
+                       ┌───────────────┐
+                       │  Local Tools  │
+                       └───────┬───────┘
+                               │
+Plan → Validator → Policy → Executor → ToolRegistry
+                               │
+                       ┌───────┴───────┐
+                       │   MCP Layer   │
+                       └───────┬───────┘
+                               │
+                  ┌────────────┼────────────┐
+                  ▼            ▼            ▼
+                Search       Gmail       Calendar
+                Server       Server        Server
+```
+
+### Modules
+
+| Module | Responsibility |
+| ------ | -------------- |
+| `src/app/mcp/mcpTypes.ts` | `IMcpClient`, `IMcpToolDefinition`, `IMcpCallResult` — the only MCP surface the app sees |
+| `src/app/mcp/mcpClient.ts` | `InProcessMcpClient` (tests/demos) + `StdioMcpClient` (real JSON-RPC 2.0 over stdio: `initialize` → `tools/list` → `tools/call`) |
+| `src/app/mcp/mcpToolAdapter.ts` | `McpToolAdapter implements IToolDefinition` — an MCP tool is **just a tool** to the executor |
+| `src/app/mcp/mcpToolDiscovery.ts` | `discoverMcpTools()` / `registerMcpTools()` — `tools/list` → adapter → registry |
+| `src/app/toolPolicy.ts` | Permission policy between validator and executor: `allow` / `confirm` / `deny` |
+| `scripts/mcp-echo-server.mjs` | Minimal local MCP server (`test.echo`, `calendar.list_events`, `web.search`, `gmail.send`) used by the E2E test |
+
+### The Phase 3 chain
+
+```
+MCP servers → tool discovery → ToolRegistry.listTools()
+            → knownTools/toolCatalog (live getters) → Planner prompt
+            → IPlan → PlanValidator → Permission Policy → PlanExecutor
+            → ToolRegistry.execute() → MCP → results → [Execution] → LLM
+```
+
+### Key guarantees
+
+- **3.6 Registry = abstraction:** no `if (tool === "gmail.search")` anywhere —
+  the executor only ever calls `registry.execute(step.tool, step.args)`.
+- **3.9/3.10 Security boundary:** `LLM → Planner → Validator → Permission →
+  Executor → Registry → MCP`. The LLM never calls MCP directly; `gmail.send` /
+  `calendar.delete_event` are blocked with an explicit `tool policy confirm`
+  reason (approval UX arrives in Phase 4) — proven in tests that the tool is
+  **never invoked** when blocked.
+- **3.3/3.4 Dynamic discovery:** `knownTools`, `requiredArgs` and `toolCatalog`
+  are **live getters** — MCP tools registered after `build()` are immediately
+  visible to the planner prompt (marked `(mcp)`) and to the validator
+  allow-list (including `inputSchema.required` → required args).
+- **3.11 Memory boundary:** MCP results flow through the response → existing
+  extraction/conflict pipeline; they are never written straight to Neo4j.
+- Seams: `withToolPolicy()`; registry provenance via `listTools()`
+  (`source: "local" | "mcp"`, `server`).
+
+## Phase 3.5 — MCP Server Manager (lifecycle) + Config
+
+Phase 3 left two production gaps (per design review): the `skipped`-vs-`failed`
+semantic mismatch, and MCP server lifecycle. Both are fixed here.
+
+**1. Skipped steps are skipped, not failed.** `PlanStepStatus` gained a
+`"skipped"` value; when a dependency fails (or is itself skipped), the
+dependent step is recorded as `skipped` on **both** the plan and the
+`IStepResult` — the internal state and execution result are now consistent,
+and skips propagate transitively.
+
+**2. Fleet lifecycle manager.** Real deployments run many MCP servers, so one
+owner now manages them all — outside the Agent:
+
+| Module | Responsibility |
+| ------ | -------------- |
+| `src/app/mcp/mcpServerManager.ts` | `McpServerManager` — per-id `addServer()` (connect → discover → register), `registerAll()` with per-server outcomes (a broken server never takes down Gmail/Calendar/the Agent), `reconnect()`, `isHealthy()`, `getClient()`, `closeAll()` for app exit |
+| `IMcpServerConfig` | Declarative server config: `{ id, command, args?, env?, enabled?, timeoutMs? }` — disabled servers are skipped, never failed |
+
+Chain preserved exactly:
+
+```
+MCP configuration → McpServerManager → StdioMcpClient → discover → ToolRegistry
+```
+
+Never `LLM → MCP` or `Planner → MCP` — the path stays
+`Planner → Plan → Validator → Policy → Executor → Registry → Adapter → MCP`.
+
 ## Phase-wise Roadmap
 
 | Phase | Name | Scope | Status |
 | ----- | ---- | ----- | ------ |
 | 1 | Intent Engine | Question / Task / Conversation + signals; classification only | ✅ Done |
 | 2 | Planning Engine | `IPlan` + dependencies, validator, executor, MCP-ready tool registry | ✅ Done |
-| 3 | MCP Tool Layer | Gmail / Calendar / GitHub tools behind one MCP interface | Next |
+| 3 | MCP Tool Layer | Local + MCP tools behind one registry, discovery, adapter, stdio client, permission policy | ✅ Done |
 | 4 | Action + Memory | Execute actions, store results back into the graph | Planned |
 | 5 | User Preferences | Durable preference model with precedence over generic facts | Planned |
 | 6 | Proactive Agent | Scheduled nudges from graph state + feedback loop | Planned |
@@ -414,7 +504,13 @@ Personal-Agent/
 │   │   ├── planTypes.ts       # Phase 2: IPlan / IPlanStep / statuses / threshold
 │   │   ├── planValidator.ts   # Phase 2: deterministic plan validator (ids, deps, cycles, tools, args)
 │   │   ├── planExecutor.ts    # Phase 2: dependency-ordered executor (fail → skip dependents)
-│   │   ├── toolRegistry.ts    # Phase 2: tool registry (MCP-ready seam for Phase 3)
+│   │   ├── toolRegistry.ts    # Phase 2/3: tool registry — local + MCP behind ONE abstraction
+│   │   ├── toolPolicy.ts      # Phase 3: permission policy (allow/confirm/deny) before tool calls
+│   │   ├── mcp/               # Phase 3: MCP boundary
+│   │   │   ├── mcpTypes.ts        # IMcpClient / IMcpToolDefinition / IMcpCallResult
+│   │   │   ├── mcpClient.ts       # InProcessMcpClient + StdioMcpClient (JSON-RPC 2.0 stdio)
+│   │   │   ├── mcpToolAdapter.ts  # MCP tool → IToolDefinition (looks local to the executor)
+│   │   │   └── mcpToolDiscovery.ts# tools/list → adapters → ToolRegistry
 │   │   ├── runningContext.ts  # System prompt context builder
 │   │   └── selfCorrection.ts  # Graph update logic for resolving conflicts
 │   └── tests/                 # Unit, integration, and E2E test suites
@@ -531,6 +627,7 @@ OPENAI_API_KEY=sk-...
 | `npm run test:neo4j` | Runs the Neo4j memory store test suite |
 | `npm run test:intent` | Runs the Phase 1 Intent Engine + Agent wiring tests |
 | `npm run test:planner` | Runs the Phase 2 Planning Engine test suite |
+| `npm run test:mcp` | Runs the Phase 3 MCP Tool Layer E2E suite (spawns the local MCP echo server) |
 
 ### Frontend (`frontend/`)
 
@@ -558,6 +655,10 @@ Test scripts for backend subsystems are located in `src/tests/` and can be run u
 - **Phase 2 — Planning Engine (no Neo4j / OpenAI needed):**
   ```bash
   npm run test:planner
+  ```
+- **Phase 3 — MCP Tool Layer (no Neo4j / OpenAI needed; spawns a local MCP server):**
+  ```bash
+  npm run test:mcp
   ```
 - **Store Operations:**
   ```bash

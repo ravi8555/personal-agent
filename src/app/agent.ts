@@ -7,6 +7,8 @@ import { PlanExecutor } from "./planExecutor.js"
 import type { IPlanExecutionResult } from "./planExecutor.js"
 import { buildDynamicContext } from "./dynamicContext.js"
 import { createDefaultToolRegistry, ToolRegistry } from "./toolRegistry.js"
+import { createDefaultToolPolicy } from "./toolPolicy.js"
+import type { IToolPolicy } from "./toolPolicy.js"
 import type { IPlan, IPlanStep } from "./planTypes.js"
 import { Memory } from "./memory.js"
 import { MemoryProcessor } from "./memoryProcessor.js"
@@ -72,6 +74,8 @@ export class AgentBuilder {
     public planner: Planner | undefined
     public planExecutor: PlanExecutor | undefined
     public toolRegistry: ToolRegistry | undefined
+    /** Phase 3 (3.9): permission policy between validator and executor. */
+    public toolPolicy: IToolPolicy | undefined
 
     constructor() {
         this.toolList = []
@@ -158,6 +162,16 @@ export class AgentBuilder {
         return this
     }
 
+    /**
+     * Phase 3 (3.9): permission policy applied by the PlanExecutor before
+     * any tool (local or MCP) executes. Defaults to the read-only-allow /
+     * state-change-confirm policy.
+     */
+    public withToolPolicy(policy: IToolPolicy) {
+        this.toolPolicy = policy
+        return this
+    }
+
     /** Phase 2: inject a custom structured planner (LLM or rule-based). */
     public withPlanner(planner: Planner) {
         this.planner = planner
@@ -197,6 +211,8 @@ export class Agent {
     private readonly planner: Planner | undefined
     private readonly planExecutor: PlanExecutor | undefined
     private readonly toolRegistry: ToolRegistry
+    /** Phase 3: permission gate applied by the executor before tool calls. */
+    private readonly toolPolicy: IToolPolicy
     /** Phase 2: last plan + execution result (in-memory, never in Neo4j). */
     private lastPlan: IPlan | null = null
     private lastPlanResult: IPlanExecutionResult | null = null
@@ -251,17 +267,26 @@ export class Agent {
         this.responder = builder.responder
         this.intentDetector = builder.intentDetector ?? detectIntent
 
-        // Phase 2: planning engine. Tools come from an injectable registry
-        // (defaults to the local demo registry; MCP tools plug in here in
-        // Phase 3). The planner prefers an LLM when a key is configured and
-        // always falls back to a deterministic rule-based plan otherwise.
+        // Phase 2/3: planning engine. Tools come from an injectable registry
+        // (local demo tools + MCP tools discovered via src/app/mcp/). The
+        // planner's knownTools is fed from registry.listTools() (3.4), so MCP
+        // discovery is automatically visible to the LLM planner. The planner
+        // prefers an LLM when a key is configured and always falls back to a
+        // deterministic rule-based plan otherwise. The executor enforces the
+        // permission policy before ANY tool (local or MCP) runs (3.9).
         this.toolRegistry = builder.toolRegistry ?? createDefaultToolRegistry()
+        this.toolPolicy = builder.toolPolicy ?? createDefaultToolPolicy()
         const llmPlannerHook = this.createLlmPlannerHook()
         this.planner = builder.planner ?? new Planner({
-            knownTools: this.toolRegistry.names(),
+            // Live getters (3.3/3.4): MCP discovery after build() stays visible.
+            knownTools: () => this.toolRegistry.listTools().map(tool => tool.name),
+            requiredArgs: () => this.toolRegistry.requiredArgsMap(),
+            toolCatalog: () => this.toolRegistry.listTools(),
             ...(llmPlannerHook ? { generatePlan: llmPlannerHook } : {}),
         })
-        this.planExecutor = builder.planExecutor ?? new PlanExecutor(this.toolRegistry)
+        this.planExecutor = builder.planExecutor ?? new PlanExecutor(this.toolRegistry, {
+            policy: this.toolPolicy,
+        })
     }
 
     /** The memory / conversation-history backing this agent. */

@@ -14,6 +14,7 @@
 import type { IPlan, IPlanStep, PlanStepKind } from "./planTypes.js";
 import { resolveStepKind } from "./planTypes.js";
 import type { ToolRegistry } from "./toolRegistry.js";
+import type { IToolPolicy } from "./toolPolicy.js";
 
 export interface IStepResult {
     stepId: string;
@@ -51,6 +52,13 @@ export interface IExecutorHooks {
      * only records that the plan is ready to answer; it never generates prose.
      */
     runResponseStep?: (step: IPlanStep, plan: IPlan) => Promise<unknown>;
+    /**
+     * Phase 3 (3.9): permission policy consulted BEFORE any tool call —
+     * LLM → Planner → Validator → Policy → Executor → Registry → MCP.
+     * A non-allow verdict fails the step with its reason; the LLM never
+     * reaches MCP directly (3.10).
+     */
+    policy?: IToolPolicy;
     /** Called as each step changes status (progress/telemetry). */
     onStep?: (result: IStepResult) => void;
     /** Max steps to run (safety valve against pathological plans). */
@@ -92,11 +100,12 @@ export class PlanExecutor {
                 const deps = step.dependsOn ?? [];
                 const depStates = deps.map(id => byId.get(id)?.status);
 
-                // Any failed dependency (incl. transitively skipped ones, which
-                // are marked failed) → skip this step. Because dependents of a
-                // skipped step also become failed, the skip propagates.
-                if (depStates.some(s => s === "failed")) {
-                    step.status = "failed";
+                // Any dependency that did not complete (failed, or skipped
+                // because ITS dependencies failed) → this step never runs.
+                // Mark it "skipped" so the plan state matches the recorded
+                // IStepResult; skipped dependents propagate the skip further.
+                if (depStates.some(s => s === "failed" || s === "skipped")) {
+                    step.status = "skipped";
                     this.record(stepResults, {
                         stepId: step.id,
                         goal: step.goal,
@@ -120,6 +129,15 @@ export class PlanExecutor {
                     let output: unknown;
                     if (kind === "tool") {
                         if (!step.tool) throw new Error("tool step without a tool name");
+                        // Phase 3: permission gate between the plan and any
+                        // tool/MCP call. "confirm"/"deny" fail the step with
+                        // an explicit reason — dependents are then skipped.
+                        if (this.hooks.policy) {
+                            const verdict = await this.hooks.policy.canExecute(step.tool, step.args ?? {});
+                            if (verdict.decision !== "allow") {
+                                throw new Error(`tool policy ${verdict.decision}: ${verdict.reason}`);
+                            }
+                        }
                         output = await this.registry.execute(step.tool, step.args ?? {});
                     } else if (kind === "decision") {
                         output = this.hooks.runDecisionStep

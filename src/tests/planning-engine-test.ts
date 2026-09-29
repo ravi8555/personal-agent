@@ -279,7 +279,7 @@ function step(id: string, goal: string, extra: Partial<IPlanStep> = {}): IPlanSt
     assert.equal(failingResult.steps[0]?.status, "failed");
     assert.match(String(failingResult.steps[0]?.error), /tool exploded/);
     assert.equal(failingResult.steps[1]?.status, "skipped");
-    assert.equal(failingPlan.steps[1]?.status, "failed", "skipped step is marked failed on the plan");
+    assert.equal(failingPlan.steps[1]?.status, "skipped", "skipped step is marked skipped on the plan");
     ok("executor: tool failure marks the step failed and skips dependents");
 
     // unknown tool referenced by a plan (validation bypassed) fails safely
