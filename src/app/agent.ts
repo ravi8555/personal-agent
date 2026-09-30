@@ -7,6 +7,8 @@ import { PlanExecutor } from "./planExecutor.js"
 import type { IPlanExecutionResult } from "./planExecutor.js"
 import { buildDynamicContext } from "./dynamicContext.js"
 import { createDefaultToolRegistry, ToolRegistry } from "./toolRegistry.js"
+import { createDefaultActionRegistry } from "./action/actionRegistry.js"
+import type { ActionRegistry } from "./action/actionRegistry.js"
 import { createDefaultToolPolicy } from "./toolPolicy.js"
 import type { IToolPolicy } from "./toolPolicy.js"
 import type { IPlan, IPlanStep } from "./planTypes.js"
@@ -76,6 +78,8 @@ export class AgentBuilder {
     public toolRegistry: ToolRegistry | undefined
     /** Phase 3 (3.9): permission policy between validator and executor. */
     public toolPolicy: IToolPolicy | undefined
+    /** Phase 4A (4.1): internal action engine for kind === "action" steps. */
+    public actionRegistry: ActionRegistry | undefined
 
     constructor() {
         this.toolList = []
@@ -172,6 +176,12 @@ export class AgentBuilder {
         return this
     }
 
+    /** Phase 4A (4.1): inject the internal action engine (defaults to pure built-ins). */
+    public withActionRegistry(actions: ActionRegistry) {
+        this.actionRegistry = actions
+        return this
+    }
+
     /** Phase 2: inject a custom structured planner (LLM or rule-based). */
     public withPlanner(planner: Planner) {
         this.planner = planner
@@ -213,6 +223,8 @@ export class Agent {
     private readonly toolRegistry: ToolRegistry
     /** Phase 3: permission gate applied by the executor before tool calls. */
     private readonly toolPolicy: IToolPolicy
+    /** Phase 4A: internal action engine for kind === "action" steps. */
+    private readonly actionRegistry: ActionRegistry
     /** Phase 2: last plan + execution result (in-memory, never in Neo4j). */
     private lastPlan: IPlan | null = null
     private lastPlanResult: IPlanExecutionResult | null = null
@@ -267,25 +279,33 @@ export class Agent {
         this.responder = builder.responder
         this.intentDetector = builder.intentDetector ?? detectIntent
 
-        // Phase 2/3: planning engine. Tools come from an injectable registry
+        // Phase 2/3/4A: planning engine. Tools come from an injectable registry
         // (local demo tools + MCP tools discovered via src/app/mcp/). The
         // planner's knownTools is fed from registry.listTools() (3.4), so MCP
         // discovery is automatically visible to the LLM planner. The planner
         // prefers an LLM when a key is configured and always falls back to a
         // deterministic rule-based plan otherwise. The executor enforces the
-        // permission policy before ANY tool (local or MCP) runs (3.9).
+        // permission policy before ANY tool (local or MCP) runs (3.9), and
+        // resolves kind === "action" steps through the Action Engine (4.1) —
+        // internal capabilities that never touch the registry or the policy.
         this.toolRegistry = builder.toolRegistry ?? createDefaultToolRegistry()
         this.toolPolicy = builder.toolPolicy ?? createDefaultToolPolicy()
+        this.actionRegistry = builder.actionRegistry ?? createDefaultActionRegistry()
         const llmPlannerHook = this.createLlmPlannerHook()
         this.planner = builder.planner ?? new Planner({
             // Live getters (3.3/3.4): MCP discovery after build() stays visible.
             knownTools: () => this.toolRegistry.listTools().map(tool => tool.name),
             requiredArgs: () => this.toolRegistry.requiredArgsMap(),
             toolCatalog: () => this.toolRegistry.listTools(),
+            // Phase 4B: the LLM planner is explicitly action-aware — live
+            // action catalog + allow-list from the ActionRegistry.
+            knownActions: () => this.actionRegistry.names(),
+            actionCatalog: () => this.actionRegistry.entries(),
             ...(llmPlannerHook ? { generatePlan: llmPlannerHook } : {}),
         })
         this.planExecutor = builder.planExecutor ?? new PlanExecutor(this.toolRegistry, {
             policy: this.toolPolicy,
+            actions: this.actionRegistry,
         })
     }
 
@@ -507,6 +527,11 @@ export class Agent {
     /** Phase 2: the tool registry backing planner + executor (MCP-ready). */
     public getToolRegistry(): ToolRegistry {
         return this.toolRegistry
+    }
+
+    /** Phase 4A: the internal action engine backing kind === "action" steps. */
+    public getActionRegistry(): ActionRegistry {
+        return this.actionRegistry
     }
 
     static builder() {

@@ -298,6 +298,67 @@ MCP configuration → McpServerManager → StdioMcpClient → discover → ToolR
 Never `LLM → MCP` or `Planner → MCP` — the path stays
 `Planner → Plan → Validator → Policy → Executor → Registry → Adapter → MCP`.
 
+## Phase 4A — Action Engine (internal capabilities)
+
+Phase 3 has `Planner → Executor → Registry → MCP` for *external* capabilities.
+Phase 4 needs the mirror concept: an Agent Action that requires **no** MCP
+tool at all — the `action` kind you already model:
+
+| Step kind | Engine | Gating |
+| --------- | ------ | ------ |
+| `tool` | ToolRegistry (MCP) | permission policy |
+| `decision` | Planner layer | structural validation |
+| **`action`** | **ActionRegistry** | **none — internal only** |
+| `response` | LLM | prompt-context labelling |
+
+- `src/app/action/actionTypes.ts` — `IActionDefinition { name, description, execute(ctx) }`, `IActionContext { stepId, goal, args, priorOutputs }`, `actionContextFromStep()`.
+- `src/app/action/actionRegistry.ts` — `ActionRegistry` (register/has/get/names/execute) + `createDefaultActionRegistry()` with pure built-ins: `text.summarize_local`, `list.pick`, `note.compose`.
+- `IPlanStep.action?` — optional explicit routing; `normalizeSteps()` preserves it.
+- `PlanExecutor` resolves named action steps through the registry with full
+  prior-output context; the **legacy `runActionStep` hook still wins** when
+  provided, and steps without a registry keep the safe acknowledgement.
+- Seams: `withActionRegistry()`, `executor.withActions()`, `hooks.actions`,
+  `getActionRegistry()` — the default Agent wires the built-ins, so
+  action-capable plans execute end-to-end with zero MCP involvement.
+
+### 4B — Action-aware Planner
+
+The LLM planner now understands internal capabilities **explicitly**,
+mirroring every live-getter concept already used for tools:
+
+- **`actionCatalog`** — `() => actionRegistry.entries()` renders a dedicated
+  prompt section so the model can't confuse the two engines:
+
+  ```
+  Available tools (…):
+  - web.search: Search the web
+
+  Available actions (internal, no approval needed; reference by "action" + "kind": "action"):
+  - text.summarize_local: Deterministic local summarizer
+  - list.pick: Pick items from a list
+  ```
+
+- **`knownActions`** — validator allow-list for steps that carry an
+  `action` name (unknown actions are rejected → LLM plan falls back, exactly
+  like unknown tools). Anonymous action steps stay valid, so legacy plans
+  are unaffected; the allow-list is opt-in — **design lock:** empty
+  `knownActions` means *don't enforce*, keeping `ActionRegistry` (runtime
+  capability) separate from `knownActions` (planner validation boundary).
+  The normal Agent path is effectively strict anyway because it always
+  wires `knownActions: () => actionRegistry.names()`.
+- **Prompt schema** now advertises `"action"?: string` and the rule
+  *tool steps name a tool; action steps name an action*.
+- **Live getters**: actions registered after `build()` are visible to both
+  prompt and validator — same pattern as `knownTools`/`requiredArgs`/
+  `toolCatalog`.
+- **4D prep:** `IStepResult.action` records the action name, so execution
+  bullets render `action "text.summarize_local"` — canonical source data
+  for the upcoming MemoryCandidate stage.
+- Test: `npm run test:planner-actions` — 11 checks (prompt section,
+  validator allow-list, live getters, LLM action plan → Agent E2E →
+  `[Execution]` → conversation memory, no Neo4j write).
+
+
 ## Phase-wise Roadmap
 
 | Phase | Name | Scope | Status |
@@ -511,6 +572,9 @@ Personal-Agent/
 │   │   │   ├── mcpClient.ts       # InProcessMcpClient + StdioMcpClient (JSON-RPC 2.0 stdio)
 │   │   │   ├── mcpToolAdapter.ts  # MCP tool → IToolDefinition (looks local to the executor)
 │   │   │   └── mcpToolDiscovery.ts# tools/list → adapters → ToolRegistry
+│   │   ├── action/              # Phase 4A: Action Engine (internal capabilities)
+│   │   │   ├── actionTypes.ts       # IActionDefinition / IActionContext
+│   │   │   └── actionRegistry.ts    # ActionRegistry + pure built-ins
 │   │   ├── runningContext.ts  # System prompt context builder
 │   │   └── selfCorrection.ts  # Graph update logic for resolving conflicts
 │   └── tests/                 # Unit, integration, and E2E test suites
@@ -628,6 +692,8 @@ OPENAI_API_KEY=sk-...
 | `npm run test:intent` | Runs the Phase 1 Intent Engine + Agent wiring tests |
 | `npm run test:planner` | Runs the Phase 2 Planning Engine test suite |
 | `npm run test:mcp` | Runs the Phase 3 MCP Tool Layer E2E suite (spawns the local MCP echo server) |
+| `npm run test:action` | Runs the Phase 4A Action Engine test suite (no Neo4j / OpenAI needed) |
+| `npm run test:planner-actions` | Runs the Phase 4B Action-aware Planner test suite (no Neo4j / OpenAI needed) |
 
 ### Frontend (`frontend/`)
 
@@ -659,6 +725,14 @@ Test scripts for backend subsystems are located in `src/tests/` and can be run u
 - **Phase 3 — MCP Tool Layer (no Neo4j / OpenAI needed; spawns a local MCP server):**
   ```bash
   npm run test:mcp
+  ```
+- **Phase 4A — Action Engine (no Neo4j / OpenAI needed):**
+  ```bash
+  npm run test:action
+  ```
+- **Phase 4B — Action-aware Planner (no Neo4j / OpenAI needed):**
+  ```bash
+  npm run test:planner-actions
   ```
 - **Store Operations:**
   ```bash

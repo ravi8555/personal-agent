@@ -46,6 +46,8 @@ export interface IPlanStep {
 
     /** Registered tool name (e.g. "web.search") — required for kind === "tool". */
     tool?: string;
+    /** Registered internal action name — optional routing for kind === "action". */
+    action?: string;
     args?: Record<string, unknown>;
 
     /** Ids of steps that must complete before this one may run. */

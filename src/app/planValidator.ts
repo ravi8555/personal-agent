@@ -27,6 +27,20 @@ export interface IValidatorOptions {
     requiredArgs?: Record<string, string[]>;
     /** Tools the LLM may reference ahead of registry support. */
     allowedUnknownTools?: string[];
+    /**
+     * Phase 4B: action names valid for this deployment (validator allow-list
+     * for steps that carry an `action` name). Steps WITHOUT an action name
+     * are unaffected — legacy plans keep working.
+     *
+     * DELIBERATELY opt-in (design lock): `knownActions.length === 0` → no
+     * enforcement. Two distinct concepts stay separate:
+     *   ActionRegistry → runtime capability
+     *   knownActions   → planner validation boundary
+     * Strict-by-default would break existing/custom planner configs; the
+     * normal Agent path is effectively strict anyway because it always
+     * wires `knownActions: () => actionRegistry.names()`.
+     */
+    knownActions?: string[];
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -49,7 +63,7 @@ export function validatePlan(plan: IPlan, options: IValidatorOptions = {}): IPla
         return { valid: false, errors: [...errors, "plan.steps must be a non-empty array"] };
     }
 
-    const { knownTools = [], requiredArgs = {}, allowedUnknownTools = [] } = options;
+    const { knownTools = [], requiredArgs = {}, allowedUnknownTools = [], knownActions = [] } = options;
 
     // --- ids unique + goals non-empty ---
     const seen = new Set<string>();
@@ -141,6 +155,22 @@ export function validatePlan(plan: IPlan, options: IValidatorOptions = {}): IPla
             if (v === undefined || v === null || (typeof v === "string" && !v.trim())) {
                 errors.push(`step ${JSON.stringify(s.id)} tool ${JSON.stringify(tool)} missing required arg ${JSON.stringify(key)}`);
             }
+        }
+    }
+
+    // --- action allow-list (Phase 4B) ---
+    // Only steps that EXPLICITLY name an action are checked; anonymous
+    // action steps (legacy acknowledgement path) stay valid.
+    for (const s of plan.steps) {
+        if (!s || typeof s.id !== "string") continue;
+        const action = (s as IPlanStep).action;
+        if (action == null || action === "") continue;
+        if (typeof action !== "string") {
+            errors.push(`step ${JSON.stringify(s.id)} action must be a string`);
+            continue;
+        }
+        if (knownActions.length > 0 && !knownActions.includes(action)) {
+            errors.push(`step ${JSON.stringify(s.id)} references unknown action ${JSON.stringify(action)}`);
         }
     }
 

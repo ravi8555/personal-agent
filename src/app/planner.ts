@@ -29,6 +29,13 @@ export interface IPlannerHooks {
     requiredArgs?: Record<string, string[]> | (() => Record<string, string[]>);
     /** Tools the planner may reference ahead of registry support. */
     allowedUnknownTools?: string[];
+    /**
+     * Phase 4B (4.2/approval): action names valid for this deployment
+     * (validator allow-list for kind === "action" steps with an `action`
+     * name). Same live-getter form as knownTools, e.g. `() =>
+     * actionRegistry.names()`.
+     */
+    knownActions?: string[] | (() => string[]);
     /** Custom fallback when the LLM path is unavailable. */
     fallback?: (input: IPlannerInput) => IPlanStep[];
     /**
@@ -36,6 +43,13 @@ export interface IPlannerHooks {
      * `() => toolRegistry.listTools()` gives name + description + provenance.
      */
     toolCatalog?: ReadonlyArray<{ name: string; description: string; source?: string }> | (() => ReadonlyArray<{ name: string; description: string; source?: string }>);
+    /**
+     * Phase 4B: internal action catalog for the LLM prompt —
+     * `() => [{ name, description }, …]` from the ActionRegistry.
+     * Rendered as an explicit "Available actions" section so the planner
+     * understands internal capabilities vs MCP tools.
+     */
+    actionCatalog?: ReadonlyArray<{ name: string; description: string }> | (() => ReadonlyArray<{ name: string; description: string }>);
     /**
      * Strict mode: when no LLM planner is available, return `llm-unavailable`
      * instead of silently degrading to the deterministic plan.
@@ -92,6 +106,7 @@ export function normalizeSteps(raw: unknown): IPlanStep[] | null {
             step.kind = rec["kind"] as PlanStepKind;
         }
         if (typeof rec["tool"] === "string" && rec["tool"].trim()) step.tool = rec["tool"].trim();
+        if (typeof rec["action"] === "string" && rec["action"].trim()) step.action = rec["action"].trim();
         if (typeof rec["args"] === "object" && rec["args"] !== null && !Array.isArray(rec["args"])) {
             step.args = rec["args"] as Record<string, unknown>;
         }
@@ -140,18 +155,27 @@ export function buildPlannerPrompt(
     input: IPlannerInput,
     knownTools: string[],
     toolCatalog: ReadonlyArray<{ name: string; description: string; source?: string }> = [],
+    actionCatalog: ReadonlyArray<{ name: string; description: string }> = [],
 ): string {
+    const toolSection = toolCatalog.length
+        ? `Available tools (prefer these; other tool names are allowed but flagged):\n${toolCatalog.map(tool => `- ${tool.name}${tool.source === "mcp" ? " (mcp)" : ""}: ${tool.description}`).join("\n")}`
+        : `Known tools (prefer these; other tool names are allowed but flagged): ${knownTools.length ? knownTools.join(", ") : "(none - use reasoning-only steps)"}.`;
+    // Phase 4B: internal capabilities get their OWN section (4.1 boundary):
+    // actions run in-process with no permission gate, tools call MCP and may
+    // need user approval. The LLM must not confuse the two.
+    const actionSection = actionCatalog.length
+        ? `\nAvailable actions (internal, no approval needed; reference by "action" + "kind": "action"):\n${actionCatalog.map(action => `- ${action.name}: ${action.description}`).join("\n")}`
+        : "";
     return [
         "You are the planning engine of a personal AI assistant.",
         "Decompose the user request into an ordered list of steps.",
         "Return STRICT JSON only, no markdown, no commentary:",
-        '{"goal": string, "steps": [{"id": string, "goal": string, "tool"?: string, "args"?: object, "dependsOn"?: string[]}]}',
-        toolCatalog.length
-            ? `Available tools (prefer these; other tool names are allowed but flagged):\n${toolCatalog.map(tool => `- ${tool.name}${tool.source === "mcp" ? " (mcp)" : ""}: ${tool.description}`).join("\n")}`
-            : `Known tools (prefer these; other tool names are allowed but flagged): ${knownTools.length ? knownTools.join(", ") : "(none - use reasoning-only steps)"}.`,
+        '{"goal": string, "steps": [{"id": string, "goal": string, "kind"?: "tool" | "decision" | "action" | "response", "tool"?: string, "action"?: string, "args"?: object, "dependsOn"?: string[]}]}',
+        toolSection + actionSection,
         "Rules: every step needs a unique kebab-case id and a concrete goal;",
         "declare dependsOn ids that already exist; keep the graph acyclic;",
-        "reasoning-only steps omit tool/args.",
+        "tool steps name a tool; action steps name an action and set kind \"action\";",
+        "reasoning-only steps omit tool/action/args.",
         `User request: ${input.goal}`,
         `Intent: ${input.intent.type} (confidence ${input.intent.confidence}; signals: ${input.intent.signals.join(", ") || "none"})`,
         input.context ? `Relevant memory context:\n${input.context}` : "Relevant memory context: (none)",
@@ -190,18 +214,24 @@ export class Planner {
         const allowedUnknownTools = this.hooks.allowedUnknownTools ?? DEFAULT_ALLOWED_UNKNOWN_TOOLS;
         const catalogSource = this.hooks.toolCatalog;
         const toolCatalog = typeof catalogSource === "function" ? catalogSource() : (catalogSource ?? []);
+        // Phase 4B: live action getters — actions registered AFTER the Agent
+        // was built are visible to the validator allow-list and the prompt.
+        const knownActionsSource = this.hooks.knownActions;
+        const knownActions = typeof knownActionsSource === "function" ? knownActionsSource() : (knownActionsSource ?? []);
+        const actionCatalogSource = this.hooks.actionCatalog;
+        const actionCatalog = typeof actionCatalogSource === "function" ? actionCatalogSource() : (actionCatalogSource ?? []);
         const goal =
             typeof input.goal === "string" && input.goal.trim() ? input.goal.trim() : "Handle the request";
 
         const validate = (steps: IPlanStep[]): { plan: IPlan | null; errors: string[] } => {
             const plan = createPlanShell(goal, steps);
-            const validation = validatePlan(plan, { knownTools, requiredArgs, allowedUnknownTools });
+            const validation = validatePlan(plan, { knownTools, requiredArgs, allowedUnknownTools, knownActions });
             return { plan: validation.valid ? plan : null, errors: validation.errors };
         };
 
         // ---- 1. LLM planner (structured JSON, strict schema) ----------------
         if (this.hooks.generatePlan) {
-            const prompt = buildPlannerPrompt(input, knownTools, toolCatalog);
+            const prompt = buildPlannerPrompt(input, knownTools, toolCatalog, actionCatalog);
             let steps: IPlanStep[] | null = null;
             try {
                 const raw = await this.hooks.generatePlan(prompt);

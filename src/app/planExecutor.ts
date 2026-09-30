@@ -15,6 +15,8 @@ import type { IPlan, IPlanStep, PlanStepKind } from "./planTypes.js";
 import { resolveStepKind } from "./planTypes.js";
 import type { ToolRegistry } from "./toolRegistry.js";
 import type { IToolPolicy } from "./toolPolicy.js";
+import { actionContextFromStep } from "./action/actionTypes.js";
+import type { ActionRegistry } from "./action/actionRegistry.js";
 
 export interface IStepResult {
     stepId: string;
@@ -23,6 +25,8 @@ export interface IStepResult {
     /** Step nature — keeps planner reasoning distinct from agent/LLM reasoning. */
     kind: PlanStepKind;
     tool?: string;
+    /** Phase 4D: action name for kind === "action" steps (canonical result). */
+    action?: string;
     output?: unknown;
     error?: string;
 }
@@ -61,17 +65,31 @@ export interface IExecutorHooks {
     policy?: IToolPolicy;
     /** Called as each step changes status (progress/telemetry). */
     onStep?: (result: IStepResult) => void;
+    /**
+     * Phase 4A (4.1): registry of INTERNAL agent actions. When an action
+     * step names a registered action, the executor calls it instead of the
+     * legacy acknowledgement — no ToolRegistry, no permission policy.
+     */
+    actions?: ActionRegistry;
     /** Max steps to run (safety valve against pathological plans). */
     maxSteps?: number;
 }
 
 export class PlanExecutor {
     private readonly registry: ToolRegistry;
+    private actions: ActionRegistry | undefined;
     private readonly hooks: IExecutorHooks;
 
     constructor(registry: ToolRegistry, hooks: IExecutorHooks = {}) {
         this.registry = registry;
         this.hooks = hooks;
+        this.actions = hooks.actions;
+    }
+
+    /** Attach the internal action engine (Phase 4A 4.1). Chainable. */
+    public withActions(actions: ActionRegistry): this {
+        this.actions = actions;
+        return this;
     }
 
     /**
@@ -144,9 +162,20 @@ export class PlanExecutor {
                             ? await this.hooks.runDecisionStep(step, plan)
                             : { decisionStep: true, decided: step.goal };
                     } else if (kind === "action") {
-                        output = this.hooks.runActionStep
-                            ? await this.hooks.runActionStep(step, plan)
-                            : { actionStep: true, action: step.goal };
+                        // Phase 4A (4.1): an action step calls an INTERNAL agent
+                        // capability by name — never the ToolRegistry, never the
+                        // permission policy (there is no external capability to
+                        // gate). Legacy hook still wins when provided.
+                        if (this.hooks.runActionStep) {
+                            output = await this.hooks.runActionStep(step, plan);
+                        } else if (step.action && this.actions) {
+                            output = await this.actions.execute(
+                                step.action,
+                                actionContextFromStep(step, this.priorOutputs(stepResults)),
+                            );
+                        } else {
+                            output = { actionStep: true, action: step.action ?? step.goal };
+                        }
                     } else {
                         // type === "response": the LLM owns the prose. The executor
                         // only records that the answer must now be formulated.
@@ -162,6 +191,7 @@ export class PlanExecutor {
                         status: "completed",
                         output,
                         ...(step.tool ? { tool: step.tool } : {}),
+                        ...(step.action ? { action: step.action } : {}),
                     });
                 } catch (error) {
                     step.status = "failed";
@@ -172,6 +202,7 @@ export class PlanExecutor {
                         status: "failed",
                         error: error instanceof Error ? error.message : String(error),
                         ...(step.tool ? { tool: step.tool } : {}),
+                        ...(step.action ? { action: step.action } : {}),
                     });
                 }
             }
@@ -194,6 +225,17 @@ export class PlanExecutor {
         sink.push(result);
         this.hooks.onStep?.(result);
     }
+
+    /** Outputs of completed steps, keyed by step id — action-step context. */
+    private priorOutputs(stepResults: IStepResult[]): Record<string, unknown> {
+        const out: Record<string, unknown> = {};
+        for (const result of stepResults) {
+            if (result.status === "completed" && result.output !== undefined) {
+                out[result.stepId] = result.output;
+            }
+        }
+        return out;
+    }
 }
 
 /** Compact, LLM-friendly rendering of execution results (kind-tagged). */
@@ -214,7 +256,11 @@ export function formatPlanResult(result: IPlanExecutionResult): string {
  */
 export function summarizeExecution(result: IPlanExecutionResult): string[] {
     return result.steps.map(s => {
-        const label = s.tool ? `${s.kind} "${s.tool}"` : s.kind;
+        const label = s.tool
+            ? `${s.kind} "${s.tool}"`
+            : s.action
+                ? `${s.kind} "${s.action}"`
+                : s.kind;
         if (s.status === "completed") {
             const out = typeof s.output === "string" ? s.output : JSON.stringify(s.output);
             return `${s.goal} — done (${label})${out ? `: ${out}` : ""}`;

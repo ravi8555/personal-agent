@@ -14,7 +14,9 @@
     "test:neo4j": "node --env-file=.env --import tsx src/tests/neo4jMemoryStore-test.ts",
     "test:intent": "node --import tsx src/tests/intent-engine-test.ts && node --import tsx src/tests/intent-agent-wiring-test.ts",
     "test:planner": "node --import tsx src/tests/planning-engine-test.ts",
-    "test:mcp": "node --import tsx src/tests/mcp-tool-e2e-test.ts"
+    "test:mcp": "node --import tsx src/tests/mcp-tool-e2e-test.ts",
+    "test:action": "node --import tsx src/tests/action-engine-test.ts",
+    "test:planner-actions": "node --import tsx src/tests/planner-action-aware-test.ts"
   },
   "devDependencies": {
     "@types/node": "^26.2.0",
