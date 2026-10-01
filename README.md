@@ -395,6 +395,73 @@ Acceptance criteria proven by `npm run test:pipeline` (7 checks):
 Layout now matches the recommended Phase 4 structure:
 `action/actionTypes.ts` · `action/actionRegistry.ts` · `action/defaultActions.ts`
 
+### 4D — Unified Execution Result → MemoryCandidate
+
+`IPlanExecutionResult` stays the **root object** and is now the *only* canonical
+machine-readable source. One result model for all step kinds — deliberately
+**no** `IToolExecutionResult` / `IActionExecutionResult` / `IDecisionExecutionResult`.
+
+| Component | Responsibility |
+| --------- | -------------- |
+| Planner | decide what steps should happen |
+| Validator | validate the proposed plan |
+| Permission Policy | gate external tools |
+| PlanExecutor | execute steps |
+| ToolRegistry | execute external tools |
+| ActionRegistry | execute internal actions |
+| **IPlanExecutionResult** | **canonical record of execution** |
+| **ExecutionResultProcessor** | **execution → memory candidates** |
+| Memory Extraction → Conflict → Feedback → Neo4j | later phases (4E+) |
+
+**Provenance (4D.2):** `IStepResult` gained `args?: Record<string, unknown>`
+alongside the existing `tool?` / `action?`. `args` is **internal provenance
+only** — tool/action arguments are never turned into memory automatically
+(`gmail.send`, `calendar.delete`, `web.search` query text are not facts).
+
+**The boundary (4D.3):**
+
+```
+IStepResult       → "What happened during execution?"      (execution truth)
+MemoryCandidate   → "What might be worth remembering?"     (interpretation)
+```
+
+`IMemoryCandidate { source: "execution", planId, stepId, kind, tool?, action?, goal, content }`
+— called *candidate* on purpose: eligibility is structural; whether it becomes
+a fact is decided later by extraction/conflict.
+
+**Eligibility rules (4D.6) — deterministic:**
+
+| Step | Default |
+| ---- | ------- |
+| completed `tool` + output | ✅ candidate |
+| completed `action` + output | ✅ candidate |
+| completed `decision` + output | ✅ candidate (kind preserved — a planner decision is not necessarily a user fact) |
+| completed `response` | ❌ no automatic candidate (generated language ≠ new information) |
+| failed (any kind) | ❌ never |
+| skipped | ❌ never (Phase 3.5 semantics) |
+| completed w/o output | ❌ never |
+
+All four are configurable via `ICandidateEligibility`
+(`includeTools` / `includeActions` / `includeDecisions` / `includeResponses`).
+
+**Presentation stays separate (4D.8):**
+
+```
+IPlanExecutionResult ─┬─► summarizeExecution() ─► [Execution] ─► LLM   (presentation)
+                      └─► ExecutionResultProcessor ─► MemoryCandidate[] (machine source)
+```
+
+**No Neo4j from 4D (4D.10):** `src/app/execution/` is statically verified to
+contain no `neo4j` / `MemoryStore` / `graphStore` / `openai` references in code
+(comments document the boundary; assertions scan the stripped code), so the
+Phase 3.11 guarantee holds: MCP/tool results reach the graph **only** through
+the existing extraction → conflict → feedback pipeline.
+
+Test: `npm run test:execution` — 18 checks (your 15-item matrix: canonical
+envelope, tool/action/decision/response provenance, eligibility, output
+preservation, plan/step provenance, presentation separation, memory + MCP
+boundary).
+
 
 ## Phase-wise Roadmap
 
@@ -613,6 +680,9 @@ Personal-Agent/
 │   │   │   ├── actionTypes.ts       # IActionDefinition / IActionContext (args vs priorOutputs)
 │   │   │   ├── actionRegistry.ts    # ActionRegistry
 │   │   │   └── defaultActions.ts    # pure built-ins (summarize/pick/compose)
+│   │   ├── execution/           # Phase 4D: canonical execution → candidates
+│   │   │   ├── executionResultTypes.ts     # IMemoryCandidate / eligibility
+│   │   │   └── executionResultProcessor.ts # IPlanExecutionResult → candidates (no Neo4j)
 │   │   ├── runningContext.ts  # System prompt context builder
 │   │   └── selfCorrection.ts  # Graph update logic for resolving conflicts
 │   └── tests/                 # Unit, integration, and E2E test suites
@@ -733,6 +803,7 @@ OPENAI_API_KEY=sk-...
 | `npm run test:action` | Runs the Phase 4A Action Engine test suite (no Neo4j / OpenAI needed) |
 | `npm run test:planner-actions` | Runs the Phase 4B Action-aware Planner test suite (no Neo4j / OpenAI needed) |
 | `npm run test:pipeline` | Runs the Phase 4C Action data-flow (priorOutputs) test suite (no Neo4j / OpenAI needed) |
+| `npm run test:execution` | Runs the Phase 4D Unified Execution Result → MemoryCandidate test suite (no Neo4j / OpenAI needed) |
 
 ### Frontend (`frontend/`)
 
@@ -776,6 +847,10 @@ Test scripts for backend subsystems are located in `src/tests/` and can be run u
 - **Phase 4C — Action data-flow / priorOutputs (no Neo4j / OpenAI needed):**
   ```bash
   npm run test:pipeline
+  ```
+- **Phase 4D — Unified Execution Result → MemoryCandidate (no Neo4j / OpenAI needed):**
+  ```bash
+  npm run test:execution
   ```
 - **Store Operations:**
   ```bash

@@ -17,7 +17,8 @@
     "test:mcp": "node --import tsx src/tests/mcp-tool-e2e-test.ts",
     "test:action": "node --import tsx src/tests/action-engine-test.ts",
     "test:planner-actions": "node --import tsx src/tests/planner-action-aware-test.ts",
-    "test:pipeline": "node --import tsx src/tests/action-pipeline-test.ts"
+    "test:pipeline": "node --import tsx src/tests/action-pipeline-test.ts",
+    "test:execution": "node --import tsx src/tests/execution-result-test.ts"
   },
   "devDependencies": {
     "@types/node": "^26.2.0",

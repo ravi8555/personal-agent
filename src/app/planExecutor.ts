@@ -18,6 +18,19 @@ import type { IToolPolicy } from "./toolPolicy.js";
 import { actionContextFromStep } from "./action/actionTypes.js";
 import type { ActionRegistry } from "./action/actionRegistry.js";
 
+/**
+ * Phase 4D — canonical step result.
+ *
+ * One result model for ALL step kinds (no IToolExecutionResult /
+ * IActionExecutionResult / IDecisionExecutionResult): the unified envelope is
+ * the whole point. Provenance fields carry exactly what the downstream
+ * processor needs to know: what was requested, what capability performed it,
+ * and what came back.
+ *
+ * NOTE: `args` is INTERNAL provenance — the ExecutionResultProcessor must not
+ * turn tool/action arguments into memory automatically (gmail.send,
+ * calendar.delete, web.search query text are not facts).
+ */
 export interface IStepResult {
     stepId: string;
     goal: string;
@@ -27,6 +40,8 @@ export interface IStepResult {
     tool?: string;
     /** Phase 4D: action name for kind === "action" steps (canonical result). */
     action?: string;
+    /** 4D.2: the arguments the step was executed with (internal provenance only). */
+    args?: Record<string, unknown>;
     output?: unknown;
     error?: string;
 }
@@ -192,6 +207,7 @@ export class PlanExecutor {
                         output,
                         ...(step.tool ? { tool: step.tool } : {}),
                         ...(step.action ? { action: step.action } : {}),
+                        ...(step.args ? { args: step.args } : {}),
                     });
                 } catch (error) {
                     step.status = "failed";
@@ -203,6 +219,7 @@ export class PlanExecutor {
                         error: error instanceof Error ? error.message : String(error),
                         ...(step.tool ? { tool: step.tool } : {}),
                         ...(step.action ? { action: step.action } : {}),
+                        ...(step.args ? { args: step.args } : {}),
                     });
                 }
             }
