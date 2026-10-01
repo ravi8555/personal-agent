@@ -462,6 +462,62 @@ envelope, tool/action/decision/response provenance, eligibility, output
 preservation, plan/step provenance, presentation separation, memory + MCP
 boundary).
 
+### 4E — Memory Extraction (the semantic boundary)
+
+4D answered *which execution outputs are candidates*; 4E answers *what
+facts/relations can actually be extracted from them*.
+
+```
+4D   IPlanExecutionResult → IMemoryCandidate[]        (structural, deterministic)
+                    ── 4E.1–4E.9 boundary ──
+4E   IMemoryCandidate → ICandidateMemoryExtractor → IMemoryFact[]   (semantic, confidence)
+                    ── 4F+ ──
+     Conflict Detection → Feedback → Neo4j
+```
+
+**4E.1 Input frozen** — the extractor receives **only** `IMemoryCandidate`.
+Never `IPlanExecutionResult` / `IStepResult`, ToolRegistry, ActionRegistry,
+MemoryStore or the Neo4j driver (statically enforced in tests).
+
+**4E.2 Types** (`src/app/memory/extractionTypes.ts`):
+
+```ts
+IMemoryFact      = { subject, predicate, object, confidence,
+                     source:"execution", planId, stepId, kind, tool?, action? }
+ICandidateExtraction = { source, planId, stepId, facts[], rawCandidate }
+```
+
+`MemoryCandidate` = structured output → `MemoryFact` = semantic interpretation.
+
+**4E.3 Provider-independent interface:** `ICandidateMemoryExtractor.extract(candidate)`.
+Implementations: `DeterministicMemoryExtractor` (now) / LLM + hybrid (later) —
+never hard-wired to a provider, never given a wider input.
+
+**4E.4 Deterministic rules first:** `MemoryExtractor` runs an ordered rule list
+(`createDefaultExtractionRules()`). A candidate with no matching rule yields
+**zero facts** — *structured output does not automatically equal memory.*
+
+| Candidate | Result |
+| --------- | ------ |
+| `calendar.list_events` → `[{title,time}]` | `HAS_EVENT` + `OCCURS_AT` facts (from **output**, never from `date=tomorrow` args) |
+| explicit `{subject,predicate,object}` output (e.g. `preference.record`) | passthrough fact |
+| `list.pick` → `{picked:[…]}` | **zero facts** — a pick is not a preference |
+| `web.search` / `text.summarize_local` | **zero facts** — references/summaries are not user facts |
+| `decision` | conservative — **zero facts**, `kind:"decision"` preserved (agent decision ≠ user fact) |
+
+**4E.8 Confidence** lives at *this* layer only (deterministic values, e.g.
+`0.7` / `0.6` / `0.85`, clamped to `[0,1]`); 4D candidates carry no confidence.
+
+**4E.9 No persistence:** `src/app/memory/` is statically verified (comments
+stripped) to contain **no** `neo4j` / `MemoryStore` / `ConflictDetector` /
+`FeedbackEngine` / `openai` / registry references, and the input surface is
+never widened to `IPlanExecutionResult`. Extraction output is `IMemoryFact[]`;
+4F+ owns conflict → feedback → Neo4j.
+
+Test: `npm run test:extraction` — 14 checks (candidate boundary, tool/action/
+decision extraction, upstream exclusions, provenance, no-fabrication, args
+never become facts, confidence, determinism, no-Neo4j, E2E).
+
 
 ## Phase-wise Roadmap
 
@@ -683,6 +739,10 @@ Personal-Agent/
 │   │   ├── execution/           # Phase 4D: canonical execution → candidates
 │   │   │   ├── executionResultTypes.ts     # IMemoryCandidate / eligibility
 │   │   │   └── executionResultProcessor.ts # IPlanExecutionResult → candidates (no Neo4j)
+│   │   ├── memory/              # Phase 4E: semantic extraction → facts
+│   │   │   ├── extractionTypes.ts          # IMemoryFact / ICandidateExtraction / extractor iface
+│   │   │   ├── memoryExtractor.ts          # rule engine + default deterministic rules
+│   │   │   └── deterministicMemoryExtractor.ts # no-LLM implementation (confidence here)
 │   │   ├── runningContext.ts  # System prompt context builder
 │   │   └── selfCorrection.ts  # Graph update logic for resolving conflicts
 │   └── tests/                 # Unit, integration, and E2E test suites
@@ -804,6 +864,7 @@ OPENAI_API_KEY=sk-...
 | `npm run test:planner-actions` | Runs the Phase 4B Action-aware Planner test suite (no Neo4j / OpenAI needed) |
 | `npm run test:pipeline` | Runs the Phase 4C Action data-flow (priorOutputs) test suite (no Neo4j / OpenAI needed) |
 | `npm run test:execution` | Runs the Phase 4D Unified Execution Result → MemoryCandidate test suite (no Neo4j / OpenAI needed) |
+| `npm run test:extraction` | Runs the Phase 4E Memory Extraction test suite (no Neo4j / OpenAI needed) |
 
 ### Frontend (`frontend/`)
 
@@ -851,6 +912,10 @@ Test scripts for backend subsystems are located in `src/tests/` and can be run u
 - **Phase 4D — Unified Execution Result → MemoryCandidate (no Neo4j / OpenAI needed):**
   ```bash
   npm run test:execution
+  ```
+- **Phase 4E — Memory Extraction (no Neo4j / OpenAI needed):**
+  ```bash
+  npm run test:extraction
   ```
 - **Store Operations:**
   ```bash

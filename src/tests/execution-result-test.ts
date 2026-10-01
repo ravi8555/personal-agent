@@ -270,7 +270,12 @@ function resultOf(planId: string, steps: IStepResult[]): IPlanExecutionResult {
     assert.equal(candidates[0]?.tool, "calendar.list_events");
     assert.deepEqual(candidates[0]?.content, [{ title: "Team standup", time: "09:00" }]);
     // Nothing here touches persistence: the processor has no store handle at all.
-    assert.ok(!("memoryStore" in Object.getOwnPropertyNames(createExecutionResultProcessor())), "processor holds no store");
+    const holdCheck = createExecutionResultProcessor();
+    assert.equal(
+        Object.prototype.hasOwnProperty.call(holdCheck, "memoryStore"),
+        false,
+        "processor holds no memory store",
+    );
     assert.equal(agentWroteMemory, false, "no memory write occurred from the execution path");
     ok("MCP boundary: tool result → IPlanExecutionResult → MemoryCandidate (no direct MCP → Neo4j)");
 }
