@@ -4,7 +4,8 @@
 // an LLM-produced action step through the Action Engine (4.1).
 import assert from "node:assert/strict";
 
-import { ActionRegistry, createDefaultActionRegistry } from "../app/action/actionRegistry.js";
+import { ActionRegistry } from "../app/action/actionRegistry.js";
+import { createDefaultActionRegistry } from "../app/action/defaultActions.js";
 import { ToolRegistry, createDefaultToolRegistry } from "../app/toolRegistry.js";
 import { detectIntent } from "../app/intentEngine.js";
 import { Planner, buildPlannerPrompt, normalizeSteps } from "../app/planner.js";

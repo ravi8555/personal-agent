@@ -15,7 +15,16 @@
 
 import type { IPlanStep } from "../planTypes.js";
 
-/** What the action should do — resolved by name at execution time. */
+/** What the action should do — resolved by name at execution time.
+ *
+ * 4C data-flow contract — the boundary is explicit:
+ *
+ *   args          = planner-provided inputs (declared in the plan)
+ *   priorOutputs  = execution-context inputs (outputs of COMPLETED steps,
+ *                   keyed by step id, deep-cloned per step) — the action
+ *                   itself decides how to consume them; nothing is ever
+ *                   auto-injected into args.
+ */
 export interface IActionContext {
     /** The plan step being executed (goal + explicit routing fields only). */
     stepId: string;

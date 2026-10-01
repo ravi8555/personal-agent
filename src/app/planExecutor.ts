@@ -231,10 +231,22 @@ export class PlanExecutor {
         const out: Record<string, unknown> = {};
         for (const result of stepResults) {
             if (result.status === "completed" && result.output !== undefined) {
-                out[result.stepId] = result.output;
+                // 4C isolation contract: give every step a DEEP CLONE so a
+                // later action mutating its context view can never corrupt
+                // the canonical step result or an earlier step's outputs.
+                out[result.stepId] = cloneValue(result.output);
             }
         }
         return out;
+    }
+}
+
+/** Deep-clone execution output; fall back to the reference if uncloneable. */
+function cloneValue(value: unknown): unknown {
+    try {
+        return structuredClone(value);
+    } catch {
+        return value;
     }
 }
 

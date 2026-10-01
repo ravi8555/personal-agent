@@ -3,7 +3,8 @@
 // with an explicit `action` name — never ToolRegistry, never the policy.
 import assert from "node:assert/strict";
 
-import { ActionRegistry, createDefaultActionRegistry } from "../app/action/actionRegistry.js";
+import { ActionRegistry } from "../app/action/actionRegistry.js";
+import { createDefaultActionRegistry } from "../app/action/defaultActions.js";
 import { actionContextFromStep } from "../app/action/actionTypes.js";
 import type { IActionContext } from "../app/action/actionTypes.js";
 import { ToolRegistry } from "../app/toolRegistry.js";

@@ -358,6 +358,43 @@ mirroring every live-getter concept already used for tools:
   validator allow-list, live getters, LLM action plan → Agent E2E →
   `[Execution]` → conversation memory, no Neo4j write).
 
+### 4C — Action data-flow (priorOutputs)
+
+Data flow, not more actions. The boundary stays explicit — nothing is ever
+auto-injected:
+
+```
+args          = planner-provided inputs (declared in the plan)
+priorOutputs  = execution-context inputs (COMPLETED steps, keyed by step id)
+```
+
+`PlanExecutor` accumulates outputs of completed steps and hands each action a
+**deep-cloned** view (`structuredClone`), so a later action mutating its
+context can never corrupt the canonical step result or earlier outputs.
+
+Acceptance criteria proven by `npm run test:pipeline` (7 checks):
+
+1. **Sequential** `A → B` — B receives `priorOutputs.A`; B's `args` stay
+   exactly what the planner wrote.
+2. **Multi-step** `A → B → C` — C receives **both** `{A, B}` (accumulated
+   context, not just the previous step).
+3. **Dependency-aware fan-in** `A ─┐ ├→ C` — C receives each required branch;
+   context is **forward-only** (C never sees steps that had not yet run).
+4. **Output isolation** — an action that deliberately mutates its
+   `priorOutputs` view leaves the canonical step result and downstream
+   consumers untouched.
+5. **Tool → action** — `web.search → list.pick → note.compose`: the action
+   reads the tool's output via `args.from` **through `priorOutputs`**.
+6. **Action → tool stays explicit** — the tool receives `step.args` only and
+   remains behind the permission gate (`gmail.send` → `tool policy confirm`);
+   `priorOutputs` are never injected into tool args.
+7. `note.compose` resolution order: explicit `args` → `priorOutputs[stepId]` →
+   nested fields of prior outputs; unresolvable placeholders render empty
+   (no fabrication).
+
+Layout now matches the recommended Phase 4 structure:
+`action/actionTypes.ts` · `action/actionRegistry.ts` · `action/defaultActions.ts`
+
 
 ## Phase-wise Roadmap
 
@@ -572,9 +609,10 @@ Personal-Agent/
 │   │   │   ├── mcpClient.ts       # InProcessMcpClient + StdioMcpClient (JSON-RPC 2.0 stdio)
 │   │   │   ├── mcpToolAdapter.ts  # MCP tool → IToolDefinition (looks local to the executor)
 │   │   │   └── mcpToolDiscovery.ts# tools/list → adapters → ToolRegistry
-│   │   ├── action/              # Phase 4A: Action Engine (internal capabilities)
-│   │   │   ├── actionTypes.ts       # IActionDefinition / IActionContext
-│   │   │   └── actionRegistry.ts    # ActionRegistry + pure built-ins
+│   │   ├── action/              # Phase 4A/4C: Action Engine (internal capabilities)
+│   │   │   ├── actionTypes.ts       # IActionDefinition / IActionContext (args vs priorOutputs)
+│   │   │   ├── actionRegistry.ts    # ActionRegistry
+│   │   │   └── defaultActions.ts    # pure built-ins (summarize/pick/compose)
 │   │   ├── runningContext.ts  # System prompt context builder
 │   │   └── selfCorrection.ts  # Graph update logic for resolving conflicts
 │   └── tests/                 # Unit, integration, and E2E test suites
@@ -694,6 +732,7 @@ OPENAI_API_KEY=sk-...
 | `npm run test:mcp` | Runs the Phase 3 MCP Tool Layer E2E suite (spawns the local MCP echo server) |
 | `npm run test:action` | Runs the Phase 4A Action Engine test suite (no Neo4j / OpenAI needed) |
 | `npm run test:planner-actions` | Runs the Phase 4B Action-aware Planner test suite (no Neo4j / OpenAI needed) |
+| `npm run test:pipeline` | Runs the Phase 4C Action data-flow (priorOutputs) test suite (no Neo4j / OpenAI needed) |
 
 ### Frontend (`frontend/`)
 
@@ -733,6 +772,10 @@ Test scripts for backend subsystems are located in `src/tests/` and can be run u
 - **Phase 4B — Action-aware Planner (no Neo4j / OpenAI needed):**
   ```bash
   npm run test:planner-actions
+  ```
+- **Phase 4C — Action data-flow / priorOutputs (no Neo4j / OpenAI needed):**
+  ```bash
+  npm run test:pipeline
   ```
 - **Store Operations:**
   ```bash
