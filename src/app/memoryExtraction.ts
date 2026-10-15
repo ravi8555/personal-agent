@@ -29,6 +29,18 @@ export interface IExtractedRelation {
     object: string
     /** Optional model confidence in [0,1]. */
     confidence?: number
+    /**
+     * 4F.8 — optional provenance, carried when the source knows it (execution
+     * facts from 4E always do; legacy conversation extraction omits it).
+     * Additive + non-breaking: the graph write path ignores these fields, so
+     * no Phase 3 Cypher changes.
+     */
+    source?: string
+    planId?: string
+    stepId?: string
+    kind?: string
+    tool?: string
+    action?: string
 }
 
 export interface IExtractedFeedback {

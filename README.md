@@ -518,6 +518,80 @@ Test: `npm run test:extraction` — 14 checks (candidate boundary, tool/action/
 decision extraction, upstream exclusions, provenance, no-fabrication, args
 never become facts, confidence, determinism, no-Neo4j, E2E).
 
+### 4F — Extraction → Existing Memory Pipeline
+
+The first phase where an execution-derived fact is **allowed** to reach Neo4j
+— and only after the existing pipeline has decided what should happen to it.
+
+```
+IMemoryFact[]
+    │  (4F.3) adapter → Phase 3 normalizeRelation()
+    ▼
+INormalizedRelation[]
+    │  (4F.4) ConflictDetector — DELEGATED
+    ▼
+IConflictAnalysis
+    │  (4F.5) FeedbackEngine — DELEGATED
+    ▼
+IFeedback[]
+    │  (4F.6) Neo4jMemoryStore — only now
+    ▼
+IMemoryPipelineResult { received, normalized, persisted, conflicts, rejected }
+```
+
+**Never `Execution → Neo4j`.** 4F is *orchestration only*; conflict/feedback
+semantics stay in the Phase 3 components, and no second memory pipeline is
+created.
+
+| Decision | Implementation |
+| -------- | -------------- |
+| **4F.1 input frozen** | `process(facts: IMemoryFact[])` only — statically enforced: 4F files may not mention `IPlanExecutionResult` / `IStepResult` / `IMemoryCandidate` / registries. Conversation and execution converge on the *same* semantic input. |
+| **4F.2 no second fact model** | `IMemoryFact` stays canonical; `memoryFactNormalizer.ts` is a boundary **adapter** into the existing `IExtractedRelation` shape. |
+| **4F.3 reuse Phase 3 normalization** | `factToRelation()` → `normalizeRelation()` (entityKey + canonical predicate) — reused, not redesigned. |
+| **4F.4/4F.5 delegation** | Injected `detect` / `feedback` default to Phase 3 `detectConflicts` / `decideFeedback`; tests may substitute. Order asserted: **detect → feedback → store**. |
+| **4F.6 store last** | `saveExtraction()` runs only after conflict + feedback. |
+| **4F.7 result** | `IMemoryPipelineResult { received, normalized, persisted, conflicts, rejected }` — a tally, not a memory representation. |
+| **4F.8 provenance** | `IExtractedRelation` / `INormalizedRelation` gained **additive optional** `source / planId / stepId / kind / tool / action`, passed through `normalizeRelation`. Provenance survives normalize → conflict finding → store payload. Graph Cypher unchanged (see follow-up). |
+| **4F.9 not a guaranteed write** | Zero facts → no persistence; unusable facts → `rejected`; an injectable `shouldPersist(relation, findings)` gate (default: allow, matching Phase 3). |
+| **4F.10 E2E** | `memory-pipeline-test.ts`: 20 checks (4F + 4G) incl. **real Neo4j** — execution → candidates → facts → Neo4j (graph verified) and conflict against **real graph history** → feedback → persisted → self-corrected. |
+
+**Follow-up (explicitly deferred):** provenance is preserved *in the pipeline*
+but not yet written as graph properties — `upsertRelationsQuery` still writes
+`predicate/confidence/extractedAt/extractionId` only. Adding source/planId/tool
+to `RELATES_TO` is a schema decision for a later phase.
+
+Test: `npm run test:memory-pipeline` — 20 checks (4F + 4G; unit portions need
+no Neo4j; the final sections use the real environment via `--env-file-if-exists`).
+
+### 4G — Self-Correction Integration (existing engine, no second engine)
+
+```
+IMemoryFact[] → normalize → ConflictDetector → FeedbackEngine
+                                                │
+                    IMemoryPipelineResult       ▼
+                    { conflicts = detected }  SelfCorrectionEngine (EXISTING)
+                                                │  RULE_SUPERSEDE  → parameterized DELETE
+                                                │  RULE_KEEP_CONFLICT → keep both edges
+                                                ▼
+                              corrected = mutationsApplied (approved + executed)
+```
+
+| Decision | Implementation |
+| -------- | -------------- |
+| **4G.1 inspect first** | Existing APIs mapped before code: `SelfCorrectionEngine.applyCorrections(findings)` only **deletes superseded HISTORICAL edges** and assumes the new relation was already written; `detectConflicts` is pure; `decideFeedback` → `SUPERSEDED` / `CONFLICTING`. |
+| **4G.2 boundary** | `ISelfCorrectionPort { applyCorrections(findings) }` — a **narrow port over the EXISTING** `SelfCorrectionEngine` (`createSelfCorrectionEngine(store)` is the only engine; no second resolver, no new fact model). **Opt-in**: no injection → Phase 4F behavior unchanged. |
+| **4G.3 rules** | *Detected ≠ approved*: `conflicts` counts findings; `corrected` counts **executed** mutations. `SUPERSEDED` → `RULE_SUPERSEDE` deletes the superseded edge; `CONFLICTING` (no explicit evidence) → keep-both, **zero mutations**; engine skipped entirely when no conflict. |
+| **4G.4 mutations** | Reuses the existing parameterized `DELETE` Cypher (values never inlined). Runs **after** persistence (existing-engine contract). Failures **propagate** — `process()` rejects rather than reporting success. |
+| **4G.5 tests** | 5 mocked unit checks + real-Neo4j **Part C**: `ravi DISLIKES coffee` (graph) + new `PREFERS` → conflict → feedback → self-correction → **graph verified** (`["PREFERS"]` only — not merely the proposed Cypher). Full P1–P3 + 4A–4F regression rerun. |
+
+**Ordering decision:** 4F persists *before* correction (Phase 3 semantics:
+save → feedback → correct), because the existing engine only deletes
+historical edges and assumes the new relation was written.
+`backgroundMemoryProcessor` (Phase 3) keeps its own order — both pipelines
+were deliberately **not** changed in this step.
+
+Test: `npm run test:memory-pipeline` — 20 checks (5 mocked 4G unit checks +
+real-Neo4j graph-state verification).
 
 ## Phase-wise Roadmap
 
@@ -526,7 +600,7 @@ never become facts, confidence, determinism, no-Neo4j, E2E).
 | 1 | Intent Engine | Question / Task / Conversation + signals; classification only | ✅ Done |
 | 2 | Planning Engine | `IPlan` + dependencies, validator, executor, MCP-ready tool registry | ✅ Done |
 | 3 | MCP Tool Layer | Local + MCP tools behind one registry, discovery, adapter, stdio client, permission policy | ✅ Done |
-| 4 | Action + Memory | Execute actions, store results back into the graph | Planned |
+| 4 | Action + Memory | Execute actions, store results back into the graph | ✅ 4A–4G |
 | 5 | User Preferences | Durable preference model with precedence over generic facts | Planned |
 | 6 | Proactive Agent | Scheduled nudges from graph state + feedback loop | Planned |
 
@@ -743,6 +817,10 @@ Personal-Agent/
 │   │   │   ├── extractionTypes.ts          # IMemoryFact / ICandidateExtraction / extractor iface
 │   │   │   ├── memoryExtractor.ts          # rule engine + default deterministic rules
 │   │   │   └── deterministicMemoryExtractor.ts # no-LLM implementation (confidence here)
+│   │   ├── memoryPipeline/      # Phase 4F: ORCHESTRATION of the existing pipeline
+│   │   │   ├── memoryPipelineTypes.ts      # IMemoryFact[] in / IMemoryPipelineResult out
+│   │   │   ├── memoryFactNormalizer.ts     # adapter → Phase 3 normalizeRelation()
+│   │   │   └── memoryPipeline.ts           # normalize → conflict → feedback → Neo4j
 │   │   ├── runningContext.ts  # System prompt context builder
 │   │   └── selfCorrection.ts  # Graph update logic for resolving conflicts
 │   └── tests/                 # Unit, integration, and E2E test suites
@@ -865,6 +943,7 @@ OPENAI_API_KEY=sk-...
 | `npm run test:pipeline` | Runs the Phase 4C Action data-flow (priorOutputs) test suite (no Neo4j / OpenAI needed) |
 | `npm run test:execution` | Runs the Phase 4D Unified Execution Result → MemoryCandidate test suite (no Neo4j / OpenAI needed) |
 | `npm run test:extraction` | Runs the Phase 4E Memory Extraction test suite (no Neo4j / OpenAI needed) |
+| `npm run test:memory-pipeline` | Runs the Phase 4F Memory Pipeline suite (unit + real-Neo4j E2E; uses `--env-file-if-exists`) |
 
 ### Frontend (`frontend/`)
 
@@ -916,6 +995,10 @@ Test scripts for backend subsystems are located in `src/tests/` and can be run u
 - **Phase 4E — Memory Extraction (no Neo4j / OpenAI needed):**
   ```bash
   npm run test:extraction
+  ```
+- **Phase 4F + 4G — Memory Pipeline & Self-Correction (unit + real-Neo4j E2E):**
+  ```bash
+  npm run test:memory-pipeline
   ```
 - **Store Operations:**
   ```bash

@@ -35,6 +35,18 @@ export interface INormalizedRelation {
     canonicalPredicate: boolean
     /** Optional model confidence in [0,1]. */
     confidence?: number
+    /**
+     * 4F.8 — optional provenance passed through from the source relation so a
+     * conflict finding can still distinguish `source=execution` / `kind=tool`
+     * / `tool=calendar.list_events` from `source=conversation`. Absent on the
+     * legacy conversation path; nothing depends on it being present.
+     */
+    source?: string
+    planId?: string
+    stepId?: string
+    kind?: string
+    tool?: string
+    action?: string
 }
 
 export interface IPredicateNormalization {
@@ -167,6 +179,15 @@ export function normalizeRelation(relation: IExtractedRelation): INormalizedRela
 
     const result: INormalizedRelation = { subject, predicate, object, canonicalPredicate: canonical }
     if (relation.confidence !== undefined) result.confidence = relation.confidence
+    // 4F.8: pass provenance through so downstream conflict/feedback can still
+    // distinguish execution facts from conversation facts. Only set when
+    // present — the legacy conversation path never carries these.
+    if (relation.source !== undefined) result.source = relation.source
+    if (relation.planId !== undefined) result.planId = relation.planId
+    if (relation.stepId !== undefined) result.stepId = relation.stepId
+    if (relation.kind !== undefined) result.kind = relation.kind
+    if (relation.tool !== undefined) result.tool = relation.tool
+    if (relation.action !== undefined) result.action = relation.action
     return result
 }
 

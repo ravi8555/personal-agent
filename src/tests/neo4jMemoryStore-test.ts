@@ -61,6 +61,12 @@ await store.saveExtraction(extraction);
 
 console.log("Extraction saved!");
 
+// Close the driver so the process can exit — without this the open Neo4j
+// connection keeps the event loop alive and `npm run test:neo4j` hangs forever
+// (pre-existing issue surfaced while re-running the full suite for 4G).
+await store.close()
+console.log("Connection closed.");
+
 
 // run 
 // npm exec tsx src/neo4jMemoryStore-test.ts
