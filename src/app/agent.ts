@@ -21,6 +21,13 @@ import type { ICurrentTopic, TopicAnalyzer, KnowledgeRetriever } from "./context
 import { buildRunningContext } from "./runningContext.js"
 import type { IRunningContext } from "./runningContext.js"
 import type { IRelevantKnowledge } from "./graphRetrieval.js"
+// Phase 4H: execution-memory chain (4D → 4E → 4F/4G) types + default factories.
+import type { IMemoryCandidate } from "./execution/executionResultTypes.js"
+import { createExecutionResultProcessor } from "./execution/executionResultProcessor.js"
+import type { ICandidateMemoryExtractor } from "./memory/extractionTypes.js"
+import { createDeterministicMemoryExtractor } from "./memory/deterministicMemoryExtractor.js"
+import type { IMemoryPipeline, IMemoryPipelineResult } from "./memoryPipeline/memoryPipelineTypes.js"
+import { isMemoryPipelineError } from "./memoryPipeline/memoryPipelineError.js"
 import { createGraphKnowledgeRetriever } from "./graphRetrieval.js"
 import { normalizeRelations } from "./graphNormalization.js"
 import type { INormalizedRelation } from "./graphNormalization.js"
@@ -62,6 +69,29 @@ export interface ILlmMessage {
  * the system prompt) and drive the response steps deterministically.
  */
 export type AgentResponder = (messages: readonly ILlmMessage[]) => Promise<string | null>
+
+/**
+ * Phase 4H seam (4D): the narrow structural contract the Agent needs from the
+ * execution-result processor — `IPlanExecutionResult → IMemoryCandidate[]`.
+ * Structural, so the real class or any test double qualifies.
+ */
+export type ExecutionResultProcessorLike = {
+    process(result: IPlanExecutionResult): readonly IMemoryCandidate[]
+}
+
+/**
+ * Phase 4I — what the Agent can KNOW about graph state after the execution-
+ * memory chain ran:
+ *   "unchanged"        → known no-op (no candidates/facts, persisted=0 and
+ *                        corrected=0, or a failure that provably wrote
+ *                        nothing — including pre-persist errors).
+ *   "changed"          → the pipeline reported persisted > 0 or corrected > 0.
+ *   "possibly-changed" → the pipeline failed AFTER a write could have landed
+ *                        (partial-write hardening: MemoryPipelineError with
+ *                        graphMayHaveChanged).
+ * null = the chain did not run this turn (no pipeline injected / ineligible).
+ */
+export type ExecutionMemoryState = "unchanged" | "changed" | "possibly-changed"
 
 export class AgentBuilder {
     public instructions: string | undefined
@@ -194,6 +224,44 @@ export class AgentBuilder {
         return this
     }
 
+    /** Phase 4H seam (4D): IPlanExecutionResult → IMemoryCandidate[]. */
+    public executionResultProcessor: ExecutionResultProcessorLike | undefined
+
+    /** Phase 4H seam (4E): IMemoryCandidate → IMemoryFact[] (not the conversation extractor). */
+    public candidateExtractor: ICandidateMemoryExtractor | undefined
+
+    /** Phase 4H seam (4F/4G): semantic memory pipeline — THE gate for the chain. */
+    public executionMemoryPipeline: IMemoryPipeline | undefined
+
+    /**
+     * Phase 4H (4D): inject the execution-result processor. Defaults to
+     * `createExecutionResultProcessor()` when a pipeline is configured.
+     */
+    public withExecutionResultProcessor(processor: ExecutionResultProcessorLike) {
+        this.executionResultProcessor = processor
+        return this
+    }
+
+    /**
+     * Phase 4H (4E): inject the CANDIDATE memory extractor (distinct from the
+     * conversation extractor of `withMemoryExtractor`). Defaults to
+     * `createDeterministicMemoryExtractor()` when a pipeline is configured.
+     */
+    public withCandidateExtractor(extractor: ICandidateMemoryExtractor) {
+        this.candidateExtractor = extractor
+        return this
+    }
+
+    /**
+     * Phase 4H (4F/4G): THE gate — the execution-memory chain runs only when
+     * this is injected; without it, behavior is identical to pre-4H.
+     * Conversation memory keeps its legacy MemoryScheduler path either way.
+     */
+    public withExecutionMemoryPipeline(pipeline: IMemoryPipeline) {
+        this.executionMemoryPipeline = pipeline
+        return this
+    }
+
     public build() {
         return new Agent(this)
     }
@@ -228,6 +296,14 @@ export class Agent {
     /** Phase 2: last plan + execution result (in-memory, never in Neo4j). */
     private lastPlan: IPlan | null = null
     private lastPlanResult: IPlanExecutionResult | null = null
+    /** Phase 4H: execution-memory chain (4D → 4E → 4F/4G) — opt-in via builder. */
+    private readonly executionMemoryPipeline: IMemoryPipeline | undefined
+    private readonly executionResultProcessor: ExecutionResultProcessorLike
+    private readonly candidateExtractor: ICandidateMemoryExtractor
+    /** Tally from the last execution-memory processing run (null otherwise). */
+    private lastExecutionMemory: IMemoryPipelineResult | null = null
+    /** Phase 4I: tri-state graph-change outcome; null when the chain never ran. */
+    private lastExecutionMemoryState: ExecutionMemoryState | null = null
     private readonly memoryExtractions: IMemoryExtraction[] = []
     private readonly openai: Openai
     public readonly toolMap: Map<string, ITool>
@@ -307,6 +383,14 @@ export class Agent {
             policy: this.toolPolicy,
             actions: this.actionRegistry,
         })
+
+        // Phase 4H: execution-memory chain (4D → 4E → 4F/4G). Opt-in: NOTHING
+        // runs unless a pipeline is injected; processor/extractor default to
+        // the deterministic factories so composition stays one seam. Conversation
+        // memory keeps its legacy MemoryScheduler path either way.
+        this.executionMemoryPipeline = builder.executionMemoryPipeline
+        this.executionResultProcessor = builder.executionResultProcessor ?? createExecutionResultProcessor()
+        this.candidateExtractor = builder.candidateExtractor ?? createDeterministicMemoryExtractor()
     }
 
     /** The memory / conversation-history backing this agent. */
@@ -534,6 +618,23 @@ export class Agent {
         return this.actionRegistry
     }
 
+    /**
+     * Phase 4H: the tally from the last execution-memory processing run
+     * (4F/4G `IMemoryPipelineResult`), or null when the chain never ran.
+     */
+    public getLastExecutionMemory(): IMemoryPipelineResult | null {
+        return this.lastExecutionMemory
+    }
+
+    /**
+     * Phase 4I: tri-state outcome of the last execution-memory run —
+     * "unchanged" / "changed" / "possibly-changed", or null when the chain
+     * never ran this turn (no pipeline injected / ineligible result).
+     */
+    public getLastExecutionMemoryState(): ExecutionMemoryState | null {
+        return this.lastExecutionMemoryState
+    }
+
     static builder() {
         return new AgentBuilder()
     }
@@ -550,6 +651,8 @@ export class Agent {
         this.lastIntent = this.intentDetector(query)
         this.lastPlan = null
         this.lastPlanResult = null
+        this.lastExecutionMemory = null
+        this.lastExecutionMemoryState = null
 
         // Step 11: pull relevant graph knowledge for the current topic and make
         // it part of the "running context" of the next LLM call. Guarded so a
@@ -568,6 +671,25 @@ export class Agent {
         let planningNote: string | null = null
         if (this.lastIntent.type === "task") {
             planningNote = await this.runTaskPlan(query, this.lastIntent, runningContext)
+
+            // Phase 4I: refresh the request-time context only when the graph
+            // MIGHT have changed:
+            //   "changed"          → persisted > 0 or corrected > 0 (known).
+            //   "possibly-changed" → the pipeline failed AFTER a write could
+            //                        have landed (partial-write hardening).
+            // A known no-op ("unchanged") causes NO extra retrieval calls, and
+            // refresh failures stay isolated. The `if (refreshed)` guard is a
+            // DELIBERATE 4I decision: a null refreshed context keeps the
+            // pre-execution snapshot — a missing context is never a reason to
+            // blank known memory out of the prompt.
+            if (this.executionMemoryMayHaveChangedGraph()) {
+                try {
+                    const refreshed = await this.buildRunningContext()
+                    if (refreshed) runningContext = refreshed.text
+                } catch {
+                    // isolated: keep the pre-execution context.
+                }
+            }
         }
 
         // Dynamic context: Memory Engine ("what do I know") + Planning Engine
@@ -678,11 +800,86 @@ export class Agent {
             this.lastPlanResult = result
             log(`[PlanExecutor] Plan ${result.planId} finished: ${result.status}.`)
 
+            // Phase 4H integration point: PlanExecutor produces the canonical
+            // IPlanExecutionResult; the chain 4D → 4E → 4F/4G consumes it HERE
+            // (persistence stays OUTSIDE PlanExecutor). Only plan-execution
+            // results enter — conversation turns remain on the legacy
+            // MemoryScheduler path, so nothing is duplicated or replaced.
+            await this.processExecutionMemory(result)
+
             return null
         } catch (error) {
             log(`[Planner] Planning failed, continuing without a plan: ${error instanceof Error ? error.message : String(error)}`)
             return null
         }
+    }
+
+    /**
+     * Phase 4H — execution-memory chain: IPlanExecutionResult → (4D) candidates
+     * → (4E) facts → (4F/4G) normalize/conflict/feedback/persist/self-correct.
+     *
+     * Runs ONLY when an execution memory pipeline was injected (opt-in), and
+     * only on eligible plan-execution results — never on conversation messages
+     * (the legacy scheduler keeps owning those). Failures are isolated: a
+     * store/pipeline outage logs and returns, so the user's turn still gets a
+     * response.
+     */
+    private async processExecutionMemory(result: IPlanExecutionResult): Promise<void> {
+        if (!this.executionMemoryPipeline) return
+
+        // 4J: the chain EVALUATED this result — unless a write is proven (or
+        // possibly) landed, the outcome is a KNOWN no-op ("unchanged"). The
+        // early returns below therefore keep this baseline. null stays
+        // reserved for "chain never ran" (no pipeline injected).
+        this.lastExecutionMemoryState = "unchanged"
+
+        try {
+            // 4D — structural eligibility only (completed + output present).
+            const candidates = this.executionResultProcessor.process(result)
+            if (candidates.length === 0) return
+
+            // 4E — semantic interpretation; non-semantic outputs (e.g. list.pick)
+            // yield no facts and therefore never reach the persistence layer.
+            const facts = (await Promise.all(
+                candidates.map(candidate => this.candidateExtractor.extract(candidate)),
+            )).flatMap(extraction => extraction.facts)
+            if (facts.length === 0) return
+
+            // 4F/4G — the EXISTING pipeline owns normalization, conflict
+            // detection, feedback, persistence and (when wired) self-correction.
+            const tally = await this.executionMemoryPipeline.process(facts)
+            this.lastExecutionMemory = tally
+            // 4I: tri-state outcome — known graph change vs known no-op.
+            this.lastExecutionMemoryState = tally.persisted > 0 || tally.corrected > 0
+                ? "changed"
+                : "unchanged"
+            log(
+                `[ExecutionMemory] ${facts.length} fact(s) → persisted ${tally.persisted}, `
+                + `conflicts ${tally.conflicts}, corrected ${tally.corrected}.`,
+            )
+        } catch (error) {
+            // 4I partial-write hardening: a TYPED failure that may have landed
+            // writes (correction after persistence) becomes "possibly-changed"
+            // and triggers a refresh attempt; every other failure is a known
+            // no-op ("unchanged") — no extra retrieval, pre-4H guarantee intact.
+            const possiblyChanged = isMemoryPipelineError(error) && error.graphMayHaveChanged
+            this.lastExecutionMemoryState = possiblyChanged ? "possibly-changed" : "unchanged"
+            log(
+                `[ExecutionMemory] processing failed (response continues`
+                + `${possiblyChanged ? "; graph may have changed — refresh attempted" : ""}`
+                + `): ${error instanceof Error ? error.message : String(error)}`,
+            )
+        }
+    }
+
+    /**
+     * Phase 4I: tri-state refresh decision. "changed" (known mutation) and
+     * "possibly-changed" (typed failure after a possible write) both refresh;
+     * "unchanged" and null (chain never ran) never do.
+     */
+    private executionMemoryMayHaveChangedGraph(): boolean {
+        const state = this.lastExecutionMemoryState
+        return state === "changed" || state === "possibly-changed"
     }
 
     /**

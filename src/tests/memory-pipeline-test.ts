@@ -1,4 +1,4 @@
-// Phase 4F — Memory Pipeline test.
+// Phase 4F + 4G + 4I — Memory Pipeline test.
 // Unit portions need no Neo4j/OpenAI/network; the final CRITICAL E2E section
 // uses the real Neo4j environment (requires NEO4J_* env vars).
 //
@@ -23,6 +23,8 @@ import type { IMemoryExtraction } from "../app/memoryExtraction.js";
 import { MemoryPipeline, createMemoryPipeline } from "../app/memoryPipeline/memoryPipeline.js";
 import type { IMemoryFactStore } from "../app/memoryPipeline/memoryPipelineTypes.js";
 import { factToRelation } from "../app/memoryPipeline/memoryFactNormalizer.js";
+import { MemoryPipelineError, isMemoryPipelineError } from "../app/memoryPipeline/memoryPipelineError.js";
+import { buildWriteQueries } from "../app/graphCypher.js";
 import { PlanExecutor } from "../app/planExecutor.js";
 import { createPlanShell } from "../app/planTypes.js";
 import type { IPlanStep } from "../app/planTypes.js";
@@ -31,7 +33,7 @@ import { createDefaultActionRegistry } from "../app/action/defaultActions.js";
 
 console.log(`
 =================================================
-MEMORY PIPELINE TEST (Phase 4F + 4G)
+MEMORY PIPELINE TEST (Phase 4F + 4G + 4I)
 IMemoryFact[] -> Normalize -> Conflict -> Feedback -> Persist -> Self-Correction -> Neo4j
 4F: fact -> Neo4j ONLY after normalize/conflict/feedback.
 4G: corrections DELEGATED to the EXISTING SelfCorrectionEngine (no 2nd engine).
@@ -79,6 +81,7 @@ function executionFact(partial: Partial<IMemoryFact> & Pick<IMemoryFact, "subjec
         "../app/memoryPipeline/memoryPipelineTypes.ts",
         "../app/memoryPipeline/memoryFactNormalizer.ts",
         "../app/memoryPipeline/memoryPipeline.ts",
+        "../app/memoryPipeline/memoryPipelineError.ts",
     ];
     const forbidden = [
         // execution-side inputs4F must never see (4F.1)
@@ -533,7 +536,90 @@ function executionFact(partial: Partial<IMemoryFact> & Pick<IMemoryFact, "subjec
 }
 
 // ---------------------------------------------------------------------------
-// 9. CRITICAL E2E (4F.9) — first complete execution-memory path via REAL Neo4j
+// ---------------------------------------------------------------------------
+// 9. 4I — persistence contract: tri-state failure semantics + provenance write
+// ---------------------------------------------------------------------------
+{
+    // (a) THE partial-write case: persistence SUCCEEDS, then self-correction
+    //     FAILS. process() must reject with a TYPED error whose
+    //     graphMayHaveChanged is true — and the write must actually have landed.
+    const store = recordingStore();
+    const partial = createMemoryPipeline({
+        store,
+        historical: async () => [{ subject: "ravi", predicate: "DISLIKES", object: "coffee", confidence: 0.9 }],
+        selfCorrection: {
+            async applyCorrections() { throw new Error("neo4j died mid-correction"); },
+        },
+    });
+    const failure: unknown = await partial
+        .process([executionFact({ subject: "Ravi", predicate: "PREFERS", object: "coffee" })])
+        .then(() => assert.fail("must reject"), error => error);
+    assert.ok(isMemoryPipelineError(failure), "typed pipeline error");
+    assert.equal(failure.stage, "correction");
+    assert.equal(failure.persistedFacts, 1, "persistence already landed");
+    assert.equal(failure.graphMayHaveChanged, true, "refresh signal for the Agent");
+    assert.equal(failure.message, "neo4j died mid-correction", "original message preserved");
+    assert.equal(store.calls.length, 1, "the write landed BEFORE the correction failed");
+    ok("4I: persist-then-correct failure → MemoryPipelineError(correction), graphMayHaveChanged=true");
+
+    // (b) Store outage: ONE transaction → rollback → nothing landed.
+    const down = createMemoryPipeline({
+        store: { async saveExtraction() { throw new Error("neo4j down"); } },
+    });
+    const outage: unknown = await down
+        .process([executionFact({ subject: "Ravi", predicate: "PREFERS", object: "coffee" })])
+        .then(() => assert.fail("must reject"), error => error);
+    assert.ok(isMemoryPipelineError(outage));
+    assert.equal(outage.stage, "persistence");
+    assert.equal(outage.persistedFacts, 0);
+    assert.equal(outage.graphMayHaveChanged, false, "atomic rollback → known unchanged");
+    assert.equal(outage.message, "neo4j down", "original message preserved");
+    ok("4I: persistence failure → stage=persistence, graphMayHaveChanged=false (one transaction)");
+
+    // (c) Pre-persist failure (conflict detector throws) propagates RAW —
+    //     nothing could have been written, so the Agent's unknown→unchanged
+    //     default is correct and no refresh is warranted.
+    const prePersist = createMemoryPipeline({
+        store: recordingStore(),
+        detect: () => { throw new Error("detector exploded"); },
+    });
+    await assert.rejects(
+        prePersist.process([executionFact({ subject: "Ravi", predicate: "PREFERS", object: "coffee" })]),
+        /detector exploded/,
+        "pre-persist failures stay raw — no typed error needed",
+    );
+    ok("4I: pre-persist failures propagate raw (known no write)");
+
+    // (d) Provenance is now WRITTEN to the RELATES_TO edge (4F.8 follow-up).
+    //     First-seen wins (coalesce(rel.x, r.x)); conversation relations write
+    //     nulls → properties stay absent.
+    const queries = buildWriteQueries({
+        summary: "", facts: [], feedback: [], extractedAt: "2026-01-01T00:00:00.000Z",
+        relations: [factToRelation(executionFact({ subject: "Ravi", predicate: "PREFERS", object: "coffee", tool: "calendar.create_event" }))],
+    });
+    const relQuery = queries.find(q => q.cypher.includes("RELATES_TO"));
+    assert.ok(relQuery, "relation write query exists");
+    assert.match(relQuery.cypher, /rel\.source = coalesce\(rel\.source, r\.source\)/, "first-seen provenance preserved");
+    const written = (relQuery.params as { relations: Record<string, unknown>[] }).relations[0]!;
+    assert.equal(written.source, "execution");
+    assert.equal(written.planId, "plan-123");
+    assert.equal(written.stepId, "step-1");
+    assert.equal(written.kind, "tool");
+    assert.equal(written.tool, "calendar.create_event");
+
+    const conversation = buildWriteQueries({
+        summary: "", facts: [], feedback: [], extractedAt: "2026-01-01T00:00:00.000Z",
+        relations: [{ subject: "ravi", predicate: "likes", object: "tea" }],
+    });
+    const convQuery = conversation.find(q => q.cypher.includes("RELATES_TO"))!;
+    const convWritten = (convQuery.params as { relations: Record<string, unknown>[] }).relations[0]!;
+    assert.equal(convWritten.source, null, "conversation edges carry no provenance");
+    assert.equal(convWritten.planId, null);
+    ok("4I provenance: execution relations stamp source/planId/stepId/kind/tool on RELATES_TO");
+}
+
+// ---------------------------------------------------------------------------
+// 10. CRITICAL E2E (4F.9) — first complete execution-memory path via REAL Neo4j
 // ---------------------------------------------------------------------------
 {
     const env = process.env;
@@ -696,5 +782,5 @@ function executionFact(partial: Partial<IMemoryFact> & Pick<IMemoryFact, "subjec
     }
 }
 
-console.log(`\n✅ Memory Pipeline (4F + 4G): ${pass} checks passed.`);
+console.log(`\n✅ Memory Pipeline (4F + 4G + 4I): ${pass} checks passed.`);
 

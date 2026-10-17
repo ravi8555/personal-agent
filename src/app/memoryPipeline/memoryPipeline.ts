@@ -35,6 +35,7 @@ import type { IMemoryFact } from "../memory/extractionTypes.js";
 import type { ISelfCorrectionReport } from "../selfCorrection.js";
 import { MemoryFactNormalizer } from "./memoryFactNormalizer.js";
 import type { IMemoryFactNormalizer } from "./memoryFactNormalizer.js";
+import { MemoryPipelineError } from "./memoryPipelineError.js";
 import type {
     HistoricalRelationsLoader,
     IMemoryFactStore,
@@ -189,9 +190,16 @@ export class MemoryPipeline implements IMemoryPipeline {
 
         // 5. Persist — ONLY after the pipeline decided (4F.6), and only what
         //    the persistence gate allows (4F.9: IMemoryFact ≠ guaranteed write).
+        //    4I: a store rejection is wrapped as a typed "persistence" failure.
+        //    The store writes ONE transaction, so nothing landed — persistedFacts
+        //    0 tells the caller the graph is known unchanged.
         const toPersist = deduped.filter(relation => this.shouldPersist(relation, analysis.findings));
         if (this.store && toPersist.length > 0) {
-            await this.store.saveExtraction(this.buildExtraction(toPersist));
+            try {
+                await this.store.saveExtraction(this.buildExtraction(toPersist));
+            } catch (error) {
+                throw new MemoryPipelineError("persistence", error, 0);
+            }
             result.persisted = toPersist.length;
         }
 
@@ -203,7 +211,15 @@ export class MemoryPipeline implements IMemoryPipeline {
         //    graph mutations actually executed; a CONFLICTING finding is detected
         //    (counts in `conflicts`) but kept, so it never increments `corrected`.
         if (this.selfCorrection && analysis.findings.length > 0) {
-            const report = await this.selfCorrection.applyCorrections(analysis.findings);
+            let report: ISelfCorrectionReport;
+            try {
+                report = await this.selfCorrection.applyCorrections(analysis.findings);
+            } catch (error) {
+                // 4I partial-write hardening: persistence ALREADY succeeded —
+                // the facts are in the graph even though this run rejects.
+                // persistedFacts > 0 → graphMayHaveChanged → the Agent may refresh.
+                throw new MemoryPipelineError("correction", error, result.persisted);
+            }
             this.latestCorrection = report;
             result.corrected = report.mutationsApplied;
         }

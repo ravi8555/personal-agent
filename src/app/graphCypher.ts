@@ -104,7 +104,17 @@ SET n.label = e.label,
     }
 }
 
-/** Upsert relation edges, deduped on (subject, predicate, object). */
+/**
+ * Upsert relation edges, deduped on (subject, predicate, object).
+ *
+ * 4I provenance follow-up (was "see follow-up" in 4F.8): execution-sourced
+ * relations carry their origin ONTO the RELATES_TO edge itself
+ * (`source / planId / stepId / kind / tool / action`). First-seen provenance
+ * is PRESERVED — `coalesce(rel.x, r.x)` keeps whatever is already on the edge
+ * and only stamps the property when absent, so a later conversation-path
+ * rewrite never erases where the relation entered the graph. Conversation
+ * relations (no provenance) pass nulls, which leaves the properties absent.
+ */
 export function upsertRelationsQuery(
     relations: readonly INormalizedRelation[],
     extractedAt: string,
@@ -118,7 +128,13 @@ MATCH (b:${GRAPH_NODE_LABELS.Entity} {name: r.object})
 MERGE (a)-[rel:${GRAPH_RELATIONSHIPS.RelatesTo} {predicate: r.predicate}]->(b)
 SET rel.confidence = coalesce(r.confidence, rel.confidence),
     rel.extractedAt = r.extractedAt,
-    rel.extractionId = r.extractionId`,
+    rel.extractionId = r.extractionId,
+    rel.source = coalesce(rel.source, r.source),
+    rel.planId = coalesce(rel.planId, r.planId),
+    rel.stepId = coalesce(rel.stepId, r.stepId),
+    rel.kind = coalesce(rel.kind, r.kind),
+    rel.tool = coalesce(rel.tool, r.tool),
+    rel.action = coalesce(rel.action, r.action)`,
         params: {
             relations: relations.map(r => ({
                 subject: r.subject,
@@ -127,6 +143,12 @@ SET rel.confidence = coalesce(r.confidence, rel.confidence),
                 confidence: r.confidence ?? null,
                 extractedAt,
                 extractionId,
+                source: r.source ?? null,
+                planId: r.planId ?? null,
+                stepId: r.stepId ?? null,
+                kind: r.kind ?? null,
+                tool: r.tool ?? null,
+                action: r.action ?? null,
             })),
         },
     }

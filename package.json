@@ -20,7 +20,9 @@
     "test:pipeline": "node --import tsx src/tests/action-pipeline-test.ts",
     "test:execution": "node --import tsx src/tests/execution-result-test.ts",
     "test:extraction": "node --import tsx src/tests/memory-extraction-test.ts",
-    "test:memory-pipeline": "node --env-file-if-exists=.env --env-file-if-exists=.env.local --import tsx src/tests/memory-pipeline-test.ts"
+    "test:memory-pipeline": "node --env-file-if-exists=.env --env-file-if-exists=.env.local --import tsx src/tests/memory-pipeline-test.ts",
+    "test:agent-memory-loop": "node --import tsx src/tests/agent-memory-loop-test.ts",
+    "test:agent-neo4j-e2e": "node --env-file-if-exists=.env --env-file-if-exists=.env.local --import tsx src/tests/agent-neo4j-e2e-test.ts"
   },
   "devDependencies": {
     "@types/node": "^26.2.0",

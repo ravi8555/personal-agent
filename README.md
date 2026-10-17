@@ -551,7 +551,7 @@ created.
 | **4F.4/4F.5 delegation** | Injected `detect` / `feedback` default to Phase 3 `detectConflicts` / `decideFeedback`; tests may substitute. Order asserted: **detect → feedback → store**. |
 | **4F.6 store last** | `saveExtraction()` runs only after conflict + feedback. |
 | **4F.7 result** | `IMemoryPipelineResult { received, normalized, persisted, conflicts, rejected }` — a tally, not a memory representation. |
-| **4F.8 provenance** | `IExtractedRelation` / `INormalizedRelation` gained **additive optional** `source / planId / stepId / kind / tool / action`, passed through `normalizeRelation`. Provenance survives normalize → conflict finding → store payload. Graph Cypher unchanged (see follow-up). |
+| **4F.8 provenance** | `IExtractedRelation` / `INormalizedRelation` gained **additive optional** `source / planId / stepId / kind / tool / action`, passed through `normalizeRelation`. Provenance survives normalize → conflict finding → store payload. Graph Cypher unchanged at 4F — **resolved in 4I**: provenance is now written as RELATES_TO edge properties (first-seen preserved). |
 | **4F.9 not a guaranteed write** | Zero facts → no persistence; unusable facts → `rejected`; an injectable `shouldPersist(relation, findings)` gate (default: allow, matching Phase 3). |
 | **4F.10 E2E** | `memory-pipeline-test.ts`: 20 checks (4F + 4G) incl. **real Neo4j** — execution → candidates → facts → Neo4j (graph verified) and conflict against **real graph history** → feedback → persisted → self-corrected. |
 
@@ -593,6 +593,111 @@ were deliberately **not** changed in this step.
 Test: `npm run test:memory-pipeline` — 20 checks (5 mocked 4G unit checks +
 real-Neo4j graph-state verification).
 
+### 4H — Agent ↔ Execution-Memory Loop (composition + refresh)
+
+```
+run(query)
+  ├─ Step 11:  buildRunningContext()             (pre-execution snapshot)
+  ├─ Step 11b: Planner → PlanExecutor → IPlanExecutionResult
+  │              └─ processExecutionMemory()          ← integration point
+  │                  (4D) candidates → (4E) facts → (4F/4G) pipeline
+  ├─ graph changed? (persisted > 0 || corrected > 0)
+  │              └─ YES → buildRunningContext() again → fresh runningContext
+  └─ dynamicContext → system prompt → LLM
+```
+
+| Decision | Implementation |
+| -------- | -------------- |
+| **Opt-in gate** | The chain runs ONLY when `withExecutionMemoryPipeline(...)` is injected; processor/extractor default to the deterministic 4D/4E factories. No injection → behavior identical to pre-4H. |
+| **Narrow seams** | `withExecutionResultProcessor()` (4D), `withCandidateExtractor()` (4E — distinct from the conversation `withMemoryExtractor`), `withExecutionMemoryPipeline()` (4F/4G gate). |
+| **Integration point** | Immediately after `planExecutor.execute()` returns — persistence stays OUTSIDE PlanExecutor (4D design preserved). |
+| **Refresh "when appropriate"** | A second `buildRunningContext()` runs only when `persisted > 0 || corrected > 0`; otherwise the pre-execution context is kept (no extra retriever calls). |
+| **Failure isolation** | Pipeline errors are logged and swallowed — the turn always gets a response; no tally → no refresh. |
+| **Conversation boundary** | Only plan-execution results enter the chain. `I prefer tea over coffee.` stays on the legacy MemoryScheduler path — nothing duplicated or replaced. |
+| **Provenance** | `getLastExecutionMemory()` exposes the last 4F/4G `IMemoryPipelineResult` tally. |
+
+Test: `npm run test:agent-memory-loop` — 11 checks (4H + 4I; no Neo4j/OpenAI;
+uses the `withResponder()` seam + fake retriever/pipeline). Note: an initial
+context build fires the retriever **twice** (watcher change-notification +
+direct retrieval — pre-existing Phase B behavior); the 4H refresh adds exactly one more.
+
+### 4I — Persistence Contract & Failure Semantics (partial-write hardening)
+
+A pipeline run has GRAPH SIDE EFFECTS (persist → self-correct). When
+`process()` rejects, the Agent must know whether the graph may have changed —
+and must NOT refresh on every error (that would break the "no graph change →
+no extra retrieval calls" guarantee).
+
+**Tri-state outcome** (`ExecutionMemoryState`, exposed via
+`getLastExecutionMemoryState()`):
+
+| State | When | Refresh? |
+| ----- | ---- | -------- |
+| `"unchanged"` | known no-op: no candidates/facts, `persisted=0 && corrected=0`, or a failure that provably wrote nothing (pre-persist errors, atomic store rollback, unknown errors) | no |
+| `"changed"` | `persisted > 0 \|\| corrected > 0` | yes |
+| `"possibly-changed"` | typed failure AFTER a write could have landed | yes (attempt) |
+| `null` | chain never ran this turn (no pipeline / ineligible result) | no |
+
+Since 4J, the chain-evaluated-but-empty cases (no candidates / no facts)
+report `"unchanged"` — a known no-op — and `null` is strictly reserved for
+"chain never ran".
+
+**Error taxonomy — `MemoryPipelineError { stage, cause, persistedFacts, graphMayHaveChanged }`:**
+
+| Stage | Meaning | `persistedFacts` | `graphMayHaveChanged` |
+| ----- | ------- | ---------------- | --------------------- |
+| `"persistence"` | store write failed — ONE transaction ⇒ rollback | 0 | false |
+| `"correction"` | persistence SUCCEEDED, then the SelfCorrectionEngine failed | = persisted | true |
+
+Pre-persist failures (historical load, conflict detection, feedback,
+normalization) propagate **raw** — nothing could have been written, so
+unknown → `unchanged` (the Agent's default for untyped errors as well).
+`process()` still REJECTS; the typed error adds diagnostics, never changes the contract.
+
+**Provenance now reaches the graph (the 4F.8 follow-up):** execution relations
+stamp `source / planId / stepId / kind / tool / action` as RELATES_TO edge
+properties. First-seen wins — `coalesce(rel.x, r.x)` keeps the origin already
+on the edge, so a later conversation-path rewrite never erases it.
+Conversation relations pass nulls ⇒ the properties stay absent.
+
+**Null-refresh decision (deliberate):** `run()` keeps the previous snapshot when
+a refresh legitimately returns null — a missing context never blanks known
+memory from the prompt. Refresh failures remain fully isolated.
+
+Test: `npm run test:memory-pipeline` (4 checks, section 9) +
+`npm run test:agent-memory-loop` (4 checks, section 7).
+
+### 4J — Full Agent ↔ Neo4j End-to-End Verification
+
+Connects the 4H/4I Agent-loop proofs with REAL persistence. Everything is
+real — Agent, `Neo4jMemoryStore`, `GraphKnowledgeRetriever`, the deterministic
+4D→4E chain, the 4F/4G pipeline and the existing `SelfCorrectionEngine` — with
+exactly ONE seam: `withResponder()` replaces only the final LLM call. It never
+replaces graph retrieval or the execution-memory pipeline. (The deterministic
+planner is injected the way every other suite does; the graph path is untouched.)
+
+**The proof is three-way agreement, not a tally:**
+
+| Layer | Scenario A — supersede | Scenario B — partial write (4I) |
+| ----- | ---------------------- | ------------------------------ |
+| Tally | `conflicts=1, persisted=1, corrected=1` — detected ≠ requested ≠ applied | rejected → `possibly-changed` |
+| **Graph (authoritative)** | `DISLIKES` edge GONE; `LIKES` present **with provenance** (`source/planId/kind/tool`) | BOTH edges: `LIKES` landed, `DISLIKES` not deleted |
+| Refreshed context | contains `LIKES`, no `DISLIKES` | contains both (the true partial state) |
+| LLM prompt | contains `LIKES`, no `DISLIKES` | contains both — the persisted fact surfaced despite the failure |
+| Response | delivered | delivered (failure isolated) |
+
+Applied mutation ≠ corrected count: the test **queries the graph** for the
+deleted edge rather than trusting `mutationsApplied`.
+
+**Fixture isolation:** subject AND objects get unique letters-only names per run
+(`ravifixture…` / `beveragequark…` / `glacierquark…` + 12 random letters — the
+topic analyzer skips digit-bearing tokens), stale state seeded up front,
+cleanup before, after, and in `finally`. The subject is deliberately
+run-scoped: cleanup uses `DETACH DELETE` (whole entity + all its edges), so a
+shared name like `ravi` would delete a real user's memory graph.
+
+Test: `npm run test:agent-neo4j-e2e` — 3 checks (requires NEO4J_* env).
+
 ## Phase-wise Roadmap
 
 | Phase | Name | Scope | Status |
@@ -600,7 +705,7 @@ real-Neo4j graph-state verification).
 | 1 | Intent Engine | Question / Task / Conversation + signals; classification only | ✅ Done |
 | 2 | Planning Engine | `IPlan` + dependencies, validator, executor, MCP-ready tool registry | ✅ Done |
 | 3 | MCP Tool Layer | Local + MCP tools behind one registry, discovery, adapter, stdio client, permission policy | ✅ Done |
-| 4 | Action + Memory | Execute actions, store results back into the graph | ✅ 4A–4G |
+| 4 | Action + Memory | Execute actions, store results back into the graph | ✅ 4A–4J |
 | 5 | User Preferences | Durable preference model with precedence over generic facts | Planned |
 | 6 | Proactive Agent | Scheduled nudges from graph state + feedback loop | Planned |
 
@@ -996,9 +1101,17 @@ Test scripts for backend subsystems are located in `src/tests/` and can be run u
   ```bash
   npm run test:extraction
   ```
-- **Phase 4F + 4G — Memory Pipeline & Self-Correction (unit + real-Neo4j E2E):**
+- **Phase 4F + 4G + 4I — Memory Pipeline, Self-Correction & Persistence Contract (unit + real-Neo4j E2E):**
   ```bash
   npm run test:memory-pipeline
+  ```
+- **Phase 4H + 4I — Agent ↔ Execution-Memory Loop & Failure Semantics (no Neo4j / OpenAI needed):**
+  ```bash
+  npm run test:agent-memory-loop
+  ```
+- **Phase 4J — Full Agent ↔ Neo4j E2E (requires running Neo4j):**
+  ```bash
+  npm run test:agent-neo4j-e2e
   ```
 - **Store Operations:**
   ```bash

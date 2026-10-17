@@ -32,8 +32,9 @@ export interface IExtractedRelation {
     /**
      * 4F.8 — optional provenance, carried when the source knows it (execution
      * facts from 4E always do; legacy conversation extraction omits it).
-     * Additive + non-breaking: the graph write path ignores these fields, so
-     * no Phase 3 Cypher changes.
+     * Additive + non-breaking. As of Phase 4I the graph write path persists
+     * these as RELATES_TO edge properties (first-seen preserved), so
+     * provenance now reaches the graph itself, not just the pipeline.
      */
     source?: string
     planId?: string
